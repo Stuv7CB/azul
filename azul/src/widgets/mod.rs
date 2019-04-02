@@ -4,6 +4,7 @@ pub mod button;
 pub mod label;
 pub mod text_input;
 pub mod table_view;
+pub mod checkbox;
 
 pub mod errors {
     #[cfg(all(feature = "svg", feature = "svg_parsing"))]
