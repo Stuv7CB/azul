@@ -131,3 +131,8 @@ required-features = []
 name = "opengl"
 path = "../examples/opengl.rs"
 required-features = []
+
+[[example]]
+name = "checkbox"
+path = "../examples/checkbox.rs"
+required-features = []
