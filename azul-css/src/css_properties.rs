@@ -1,12 +1,17 @@
 //! Provides a public API with datatypes used to describe style properties of DOM nodes.
 
+use std::collections::BTreeMap;
+use std::fmt;
+
+/// Currently hard-coded: Height of one em in pixels
+const EM_HEIGHT: f32 = 16.0;
+/// WebRender measures in points, not in pixels!
+const PT_TO_PX: f32 = 96.0 / 72.0;
+
 // The following types are present in webrender, however, azul-css should not
 // depend on webrender, just to have the same types, azul-css should be a standalone crate.
 
 /// Only used for calculations: Rectangle (x, y, width, height) in layout space.
-use std::collections::BTreeMap;
-use std::fmt;
-
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
 pub struct LayoutRect { pub origin: LayoutPoint, pub size: LayoutSize }
 /// Only used for calculations: Size (width, height) in layout space.
@@ -34,15 +39,15 @@ pub struct PixelSize { pub width: PixelValue, pub height: PixelValue }
 
 impl PixelSize {
 
-    pub fn new(width: PixelValue, height: PixelValue) -> Self {
+    pub const fn new(width: PixelValue, height: PixelValue) -> Self {
         Self {
             width,
             height,
         }
     }
 
-    pub fn zero() -> Self {
-        Self::new(PixelValue::px(0.0), PixelValue::px(0.0))
+    pub const fn zero() -> Self {
+        Self::new(PixelValue::const_px(0), PixelValue::const_px(0))
     }
 }
 
@@ -101,11 +106,11 @@ impl Default for BorderRadius {
 
 impl BorderRadius {
 
-    pub fn zero() -> Self {
+    pub const fn zero() -> Self {
         Self::uniform(PixelSize::zero())
     }
 
-    pub fn uniform(value: PixelSize) -> Self {
+    pub const fn uniform(value: PixelSize) -> Self {
         Self {
             top_left: value,
             top_right: value,
@@ -165,15 +170,11 @@ pub enum BorderStyle {
     Inset,
     Outset,
 }
+
 #[derive(Debug, Copy, Clone, PartialEq, Ord, PartialOrd, Eq, Hash)]
 pub struct NinePatchBorder {
     // not implemented or parse-able yet, so no fields!
 }
-
-/// Currently hard-coded: Height of one em in pixels
-pub const EM_HEIGHT: f32 = 16.0;
-/// WebRender measures in points, not in pixels!
-pub const PT_TO_PX: f32 = 96.0 / 72.0;
 
 /// Creates `pt`, `px` and `em` constructors for any struct that has a
 /// `PixelValue` as it's self.0 field.
@@ -194,20 +195,47 @@ macro_rules! impl_pixel_value {($struct:ident) => (
             $struct(PixelValue::pt(value))
         }
     }
+
+    impl ::std::fmt::Debug for $struct {
+        fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+            write!(f, "{}({:?})", stringify!($struct), self.0)
+        }
+    }
 )}
 
-pub const CSS_PROPERTY_KEY_MAP: [(CssPropertyType, &'static str);53] = [
-    (CssPropertyType::BorderRadius,     "border-radius"),
-    (CssPropertyType::BackgroundColor,  "background-color"),
+macro_rules! impl_percentage_value{($struct:ident) => (
+    impl ::std::fmt::Debug for $struct {
+        fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+            write!(f, "{}({:?})", stringify!($struct), self.0)
+        }
+    }
+)}
+
+macro_rules! impl_float_value{($struct:ident) => (
+    impl ::std::fmt::Debug for $struct {
+        fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+            write!(f, "{}({:?})", stringify!($struct), self.0)
+        }
+    }
+)}
+
+/// Map between CSS keys and a statically typed enum
+const CSS_PROPERTY_KEY_MAP: [(CssPropertyType, &'static str);56] = [
+    (CssPropertyType::Background,       "background"),
     (CssPropertyType::BackgroundSize,   "background-size"),
     (CssPropertyType::BackgroundRepeat, "background-repeat"),
+    (CssPropertyType::BackgroundColor,  "background-color"),
+    (CssPropertyType::BackgroundImage,  "background-image"),
+
+    (CssPropertyType::BorderRadius,     "border-radius"),
     (CssPropertyType::TextColor,        "color"),
-    (CssPropertyType::Background,       "background"),
     (CssPropertyType::FontSize,         "font-size"),
     (CssPropertyType::FontFamily,       "font-family"),
     (CssPropertyType::TextAlign,        "text-align"),
     (CssPropertyType::LetterSpacing,    "letter-spacing"),
     (CssPropertyType::LineHeight,       "line-height"),
+    (CssPropertyType::WordSpacing,      "word-spacing"),
+    (CssPropertyType::TabWidth,         "tab-width"),
     (CssPropertyType::Cursor,           "cursor"),
     (CssPropertyType::Width,            "width"),
     (CssPropertyType::Height,           "height"),
@@ -257,20 +285,24 @@ pub fn get_css_key_map() -> BTreeMap<&'static str, CssPropertyType> {
     CSS_PROPERTY_KEY_MAP.iter().map(|(v, k)| (*k, *v)).collect()
 }
 
-/// Same as CssProperty, but without any data. Used to identify the
-/// key of the CSS key-value pair without parsing the value
+/// Represents a CSS key (for example `"border-radius"` => `BorderRadius`).
+/// You can also derive this key from a `CssProperty` by calling `CssProperty::get_type()`.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CssPropertyType {
-    BorderRadius,
     BackgroundColor,
+    Background,
     BackgroundSize,
     BackgroundRepeat,
+    BackgroundImage,
+
+    BorderRadius,
     TextColor,
-    Background,
     FontSize,
     FontFamily,
     TextAlign,
     LetterSpacing,
+    WordSpacing,
+    TabWidth,
     LineHeight,
     Cursor,
     Width,
@@ -325,6 +357,8 @@ impl CssPropertyType {
 
     /// Parses a CSS key, such as `width` from a string:
     ///
+    /// # Example
+    ///
     /// ```rust
     /// # use azul_css::{CssPropertyType, get_css_key_map};
     /// let map = get_css_key_map();
@@ -337,13 +371,13 @@ impl CssPropertyType {
         map.get(input).and_then(|x| Some(*x))
     }
 
+    /// Returns the original string that was used to construct this `CssPropertyType`.
     pub fn to_str(&self, map: &BTreeMap<&'static str, Self>) -> &'static str {
         map.iter().find(|(_, v)| *v == self).and_then(|(k, _)| Some(k)).unwrap()
     }
 
     /// Returns whether this property will be inherited during cascading
     pub fn is_inheritable(&self) -> bool {
-    /// Returns whether this property can trigger a re-layout
         use self::CssPropertyType::*;
         match self {
             | TextColor
@@ -355,8 +389,9 @@ impl CssPropertyType {
         }
     }
 
-    /// Returns whether this property can trigger a re-layout
+    /// Returns whether this property can trigger a re-layout (important for incremental layout and caching layouted DOMs).
     pub fn can_trigger_relayout(&self) -> bool {
+
         use self::CssPropertyType::*;
 
         // Since the border can be larger than the content,
@@ -391,11 +426,10 @@ impl fmt::Display for CssPropertyType {
     }
 }
 
-/// A property that can be used to style DOM nodes
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Represents one parsed CSS key-value pair, such as `"width: 20px"` => `CssProperty::Width(LayoutWidth::px(20.0))`
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum CssProperty {
     BorderRadius(StyleBorderRadius),
-    BackgroundColor(StyleBackgroundColor),
     BackgroundSize(StyleBackgroundSize),
     BackgroundRepeat(StyleBackgroundRepeat),
     TextColor(StyleTextColor),
@@ -407,6 +441,8 @@ pub enum CssProperty {
     LetterSpacing(StyleLetterSpacing),
     BoxShadow(StyleBoxShadow),
     LineHeight(StyleLineHeight),
+    WordSpacing(StyleWordSpacing),
+    TabWidth(StyleTabWidth),
     Cursor(StyleCursor),
     Width(LayoutWidth),
     Height(LayoutHeight),
@@ -432,10 +468,11 @@ pub enum CssProperty {
 }
 
 impl CssProperty {
+
+    /// Return the type (key) of this property as a statically typed enum
     pub fn get_type(&self) -> CssPropertyType {
         match &self {
             CssProperty::BorderRadius(_) => CssPropertyType::BorderRadius,
-            CssProperty::BackgroundColor(_) => CssPropertyType::BackgroundColor,
             CssProperty::BackgroundSize(_) => CssPropertyType::BackgroundSize,
             CssProperty::BackgroundRepeat(_) => CssPropertyType::BackgroundRepeat,
             CssProperty::TextColor(_) => CssPropertyType::TextColor,
@@ -445,6 +482,8 @@ impl CssProperty {
             CssProperty::FontFamily(_) => CssPropertyType::FontFamily,
             CssProperty::TextAlign(_) => CssPropertyType::TextAlign,
             CssProperty::LetterSpacing(_) => CssPropertyType::LetterSpacing,
+            CssProperty::WordSpacing(_) => CssPropertyType::WordSpacing,
+            CssProperty::TabWidth(_) => CssPropertyType::TabWidth,
             CssProperty::BoxShadow(_) => CssPropertyType::BoxShadow,
             CssProperty::LineHeight(_) => CssPropertyType::LineHeight,
             CssProperty::Cursor(_) => CssPropertyType::Cursor,
@@ -481,8 +520,9 @@ impl_from!(StyleFontSize, CssProperty::FontSize);
 impl_from!(StyleFontFamily, CssProperty::FontFamily);
 impl_from!(StyleTextAlignmentHorz, CssProperty::TextAlign);
 impl_from!(StyleLineHeight, CssProperty::LineHeight);
+impl_from!(StyleTabWidth, CssProperty::TabWidth);
+impl_from!(StyleWordSpacing, CssProperty::WordSpacing);
 impl_from!(StyleLetterSpacing, CssProperty::LetterSpacing);
-impl_from!(StyleBackgroundColor, CssProperty::BackgroundColor);
 impl_from!(StyleBackgroundSize, CssProperty::BackgroundSize);
 impl_from!(StyleBackgroundRepeat, CssProperty::BackgroundRepeat);
 impl_from!(StyleTextColor, CssProperty::TextColor);
@@ -518,16 +558,71 @@ impl_from!(LayoutAlignContent, CssProperty::AlignContent);
 /// they have to be casted to isizes in order to make the f32 values
 /// hash-able: Css has a relatively low precision here, roughly 5 digits, i.e
 /// `1.00001 == 1.0`
-pub const FP_PRECISION_MULTIPLIER: f32 = 10000.0;
+const FP_PRECISION_MULTIPLIER: f32 = 1000.0;
+const FP_PRECISION_MULTIPLIER_CONST: isize = FP_PRECISION_MULTIPLIER as isize;
 
 /// FloatValue, but associated with a certain metric (i.e. px, em, etc.)
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PixelValue {
     pub metric: SizeMetric,
     pub number: FloatValue,
 }
 
+// Manual Debug implementation, because the auto-generated one is nearly unreadable
+impl fmt::Debug for PixelValue {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}{:?}", self.number, self.metric)
+    }
+}
+
+impl fmt::Debug for SizeMetric {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::SizeMetric::*;
+        match self {
+            Px => write!(f, "px"),
+            Pt => write!(f, "pt"),
+            Em => write!(f, "pt"),
+        }
+    }
+}
+
+impl fmt::Debug for FloatValue {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.get())
+    }
+}
+
 impl PixelValue {
+
+    /// Same as `PixelValue::px()`, but only accepts whole numbers,
+    /// since using `f32` in const fn is not yet stabilized.
+    #[inline]
+    pub const fn const_px(value: isize) -> Self {
+        Self::const_from_metric(SizeMetric::Px, value)
+    }
+
+    /// Same as `PixelValue::em()`, but only accepts whole numbers,
+    /// since using `f32` in const fn is not yet stabilized.
+    #[inline]
+    pub const fn const_em(value: isize) -> Self {
+        Self::const_from_metric(SizeMetric::Em, value)
+    }
+
+    /// Same as `PixelValue::pt()`, but only accepts whole numbers,
+    /// since using `f32` in const fn is not yet stabilized.
+    #[inline]
+    pub const fn const_pt(value: isize) -> Self {
+        Self::const_from_metric(SizeMetric::Pt, value)
+    }
+
+    #[inline]
+    pub const fn const_from_metric(metric: SizeMetric, value: isize) -> Self {
+        Self {
+            metric: metric,
+            number: FloatValue::const_new(value),
+        }
+    }
+
     #[inline]
     pub fn px(value: f32) -> Self {
         Self::from_metric(SizeMetric::Px, value)
@@ -547,7 +642,7 @@ impl PixelValue {
     pub fn from_metric(metric: SizeMetric, value: f32) -> Self {
         Self {
             metric: metric,
-            number: value.into(),
+            number: FloatValue::new(value),
         }
     }
 
@@ -564,12 +659,25 @@ impl PixelValue {
 
 /// Wrapper around FloatValue, represents a percentage instead
 /// of just being a regular floating-point value, i.e `5` = `5%`
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PercentageValue {
     number: FloatValue,
 }
 
+impl fmt::Debug for PercentageValue {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}%", self.get())
+    }
+}
+
 impl PercentageValue {
+
+    /// Same as `PercentageValue::new()`, but only accepts whole numbers,
+    /// since using `f32` in const fn is not yet stabilized.
+    pub const fn const_new(value: isize) -> Self {
+        Self { number: FloatValue::const_new(value) }
+    }
+
     pub fn new(value: f32) -> Self {
         Self { number: value.into() }
     }
@@ -579,14 +687,21 @@ impl PercentageValue {
     }
 }
 
-/// Wrapper around an f32 value that is internally casted to an isize, in order to
-/// provide hash-ability (to avoid numerical instability).
-#[derive(Debug, PartialEq, Copy, Clone, Hash, Eq, Ord, PartialOrd)]
+/// Wrapper around an f32 value that is internally casted to an isize,
+/// in order to provide hash-ability (to avoid numerical instability).
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FloatValue {
-    number: isize,
+    pub number: isize,
 }
 
 impl FloatValue {
+
+    /// Same as `FloatValue::new()`, but only accepts whole numbers,
+    /// since using `f32` in const fn is not yet stabilized.
+    pub const fn const_new(value: isize)  -> Self {
+        Self { number: value * FP_PRECISION_MULTIPLIER_CONST }
+    }
+
     pub fn new(value: f32) -> Self {
         Self { number: (value * FP_PRECISION_MULTIPLIER) as isize }
     }
@@ -603,42 +718,31 @@ impl From<f32> for FloatValue {
 }
 
 /// Enum representing the metric associated with a number (px, pt, em, etc.)
-#[derive(Debug, PartialEq, Clone, Copy, Hash, Eq, Ord, PartialOrd)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SizeMetric {
     Px,
     Pt,
     Em,
 }
 
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StyleBorderRadius(pub BorderRadius);
 
 impl StyleBorderRadius {
-    pub fn zero() -> Self {
+    pub const fn zero() -> Self {
         StyleBorderRadius(BorderRadius::zero())
     }
 }
 
-/// Represents a `background-color` attribute
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub struct StyleBackgroundColor(pub ColorU);
-
-impl Default for StyleBackgroundColor {
-    fn default() -> Self {
-        // Transparent color
-        StyleBackgroundColor(ColorU { r: 0, g: 0, b: 0, a: 0 })
-    }
-}
-
 /// Represents a `background-size` attribute
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StyleBackgroundSize {
     Contain,
     Cover,
 }
 
 /// Represents a `background-repeat` attribute
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StyleBackgroundRepeat {
     NoRepeat,
     Repeat,
@@ -653,11 +757,11 @@ impl Default for StyleBackgroundRepeat {
 }
 
 /// Represents a `color` attribute
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StyleTextColor(pub ColorU);
 
 /// Represents a `padding` attribute
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LayoutPadding {
     pub top: Option<PixelValue>,
     pub bottom: Option<PixelValue>,
@@ -699,7 +803,7 @@ struct_all!(LayoutPadding, PixelValue);
 struct_all!(LayoutMargin, PixelValue);
 
 /// Represents a parsed `padding` attribute
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LayoutMargin {
     pub top: Option<PixelValue>,
     pub bottom: Option<PixelValue>,
@@ -708,10 +812,10 @@ pub struct LayoutMargin {
 }
 
 /// Wrapper for the `overflow-{x,y}` + `overflow` property
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LayoutOverflow {
-    pub horizontal: TextOverflowBehaviour,
-    pub vertical: TextOverflowBehaviour,
+    pub horizontal: Option<Overflow>,
+    pub vertical: Option<Overflow>,
 }
 
 impl LayoutOverflow {
@@ -719,8 +823,8 @@ impl LayoutOverflow {
     // "merges" two LayoutOverflow properties
     pub fn merge(a: &mut Option<Self>, b: &Self) {
 
-        fn merge_property(p: &mut TextOverflowBehaviour, other: &TextOverflowBehaviour) {
-            if *other == TextOverflowBehaviour::NotModified {
+        fn merge_property(p: &mut Option<Overflow>, other: &Option<Overflow>) {
+            if *other == None {
                 return;
             }
             *p = *other;
@@ -734,25 +838,24 @@ impl LayoutOverflow {
         }
     }
 
-    pub fn allows_horizontal_overflow(&self) -> bool {
-        self.horizontal.can_overflow()
+    pub fn needs_horizontal_scrollbar(&self, currently_overflowing_horz: bool) -> bool {
+        self.horizontal.unwrap_or_default().needs_scrollbar(currently_overflowing_horz)
     }
 
-    pub fn allows_vertical_overflow(&self) -> bool {
-        self.vertical.can_overflow()
+    pub fn needs_vertical_scrollbar(&self, currently_overflowing_vert: bool) -> bool {
+        self.vertical.unwrap_or_default().needs_scrollbar(currently_overflowing_vert)
     }
 
-    // If this overflow setting should show the horizontal scrollbar
-    pub fn allows_horizontal_scrollbar(&self) -> bool {
-        self.allows_horizontal_overflow()
+    pub fn is_horizontal_overflow_visible(&self) -> bool {
+        self.horizontal.unwrap_or_default().is_overflow_visible()
     }
 
-    pub fn allows_vertical_scrollbar(&self) -> bool {
-        self.allows_vertical_overflow()
+    pub fn is_vertical_overflow_visible(&self) -> bool {
+        self.vertical.unwrap_or_default().is_overflow_visible()
     }
 }
 
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StyleBorder {
     pub top: Option<StyleBorderSide>,
     pub left: Option<StyleBorderSide>,
@@ -814,7 +917,7 @@ impl StyleBorder {
 const DEFAULT_BORDER_STYLE: BorderStyle = BorderStyle::Solid;
 const DEFAULT_BORDER_COLOR: ColorU = ColorU { r: 0, g: 0, b: 0, a: 255 };
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StyleBorderSide {
     pub border_width: PixelValue,
     pub border_style: BorderStyle,
@@ -822,7 +925,7 @@ pub struct StyleBorderSide {
 }
 
 /// Represents a `box-shadow` attribute.
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StyleBoxShadow {
     pub top: Option<Option<BoxShadowPreDisplayItem>>,
     pub left: Option<Option<BoxShadowPreDisplayItem>>,
@@ -834,7 +937,7 @@ merge_struct!(StyleBoxShadow);
 struct_all!(StyleBoxShadow, Option<BoxShadowPreDisplayItem>);
 
 // missing StyleBorderRadius & LayoutRect
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BoxShadowPreDisplayItem {
     pub offset: [PixelValue;2],
     pub color: ColorU,
@@ -843,12 +946,23 @@ pub struct BoxShadowPreDisplayItem {
     pub clip_mode: BoxShadowClipMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StyleBackground {
     LinearGradient(LinearGradient),
     RadialGradient(RadialGradient),
     Image(CssImageId),
+    Color(ColorU),
     NoBackground,
+}
+
+impl StyleBackground {
+    pub fn get_css_image_id(&self) -> Option<&CssImageId> {
+        use self::StyleBackground::*;
+        match self {
+            Image(i) => Some(i),
+            _ => None,
+        }
+    }
 }
 
 impl<'a> From<CssImageId> for StyleBackground {
@@ -857,21 +971,23 @@ impl<'a> From<CssImageId> for StyleBackground {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LinearGradient {
     pub direction: Direction,
     pub extend_mode: ExtendMode,
     pub stops: Vec<GradientStopPre>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RadialGradient {
     pub shape: Shape,
     pub extend_mode: ExtendMode,
     pub stops: Vec<GradientStopPre>,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+/// CSS direction (necessary for gradients). Can either be a fixed angle or
+/// a direction ("to right" / "to left", etc.).
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Direction {
     Angle(FloatValue),
     FromTo(DirectionCorner, DirectionCorner),
@@ -945,13 +1061,13 @@ impl Direction {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Shape {
     Ellipse,
     Circle,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StyleCursor {
     /// `alias`
     Alias,
@@ -1021,7 +1137,7 @@ impl Default for StyleCursor {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DirectionCorner {
     Right,
     Left,
@@ -1076,8 +1192,9 @@ impl DirectionCorner {
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BackgroundType {
+    Color,
     LinearGradient,
     RepeatingLinearGradient,
     RadialGradient,
@@ -1091,56 +1208,60 @@ pub enum BackgroundType {
 /// Ownership allows the `Css` struct to be independent
 /// of the original source text. For example, when parsing a style
 /// from CSS, the original string can be deallocated afterwards.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CssImageId(pub String);
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GradientStopPre {
-    pub offset: Option<PercentageValue>, // this is set to None if there was no offset that could be parsed
+    // this is set to None if there was no offset that could be parsed
+    pub offset: Option<PercentageValue>,
     pub color: ColorU,
 }
 
 /// Represents a `width` attribute
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LayoutWidth(pub PixelValue);
 /// Represents a `min-width` attribute
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LayoutMinWidth(pub PixelValue);
 /// Represents a `max-width` attribute
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LayoutMaxWidth(pub PixelValue);
 /// Represents a `height` attribute
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LayoutHeight(pub PixelValue);
 /// Represents a `min-height` attribute
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LayoutMinHeight(pub PixelValue);
 /// Represents a `max-height` attribute
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LayoutMaxHeight(pub PixelValue);
 
 /// Represents a `top` attribute
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LayoutTop(pub PixelValue);
 /// Represents a `left` attribute
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LayoutLeft(pub PixelValue);
 /// Represents a `right` attribute
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LayoutRight(pub PixelValue);
 /// Represents a `bottom` attribute
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LayoutBottom(pub PixelValue);
 
 /// Represents a `flex-grow` attribute
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LayoutFlexGrow(pub FloatValue);
 /// Represents a `flex-shrink` attribute
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LayoutFlexShrink(pub FloatValue);
 
+impl_float_value!(LayoutFlexGrow);
+impl_float_value!(LayoutFlexShrink);
+
 /// Represents a `flex-direction` attribute - default: `Column`
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LayoutDirection {
     Row,
     RowReverse,
@@ -1148,20 +1269,10 @@ pub enum LayoutDirection {
     ColumnReverse,
 }
 
-/// Represents a `line-height` attribute
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
-pub struct StyleLineHeight(pub PercentageValue);
-/// Represents a `letter-spacing` attribute
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
-pub struct StyleLetterSpacing(pub PixelValue);
-
-/// Same as the `LayoutDirection`, but without the `-reverse` properties, used in the layout solver,
-/// makes decisions based on horizontal / vertical direction easier to write.
-/// Use `LayoutDirection::get_axis()` to get the axis for a given `LayoutDirection`.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum LayoutAxis {
-    Horizontal,
-    Vertical,
+impl Default for LayoutDirection {
+    fn default() -> Self {
+        LayoutDirection::Column
+    }
 }
 
 impl LayoutDirection {
@@ -1179,10 +1290,35 @@ impl LayoutDirection {
     }
 }
 
+/// Represents a `line-height` attribute
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StyleLineHeight(pub PercentageValue);
+/// Represents a `tab-width` attribute
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StyleTabWidth(pub PercentageValue);
+/// Represents a `letter-spacing` attribute
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StyleLetterSpacing(pub PixelValue);
+/// Represents a `word-spacing` attribute
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StyleWordSpacing(pub PixelValue);
+
+impl_percentage_value!(StyleTabWidth);
+impl_percentage_value!(StyleLineHeight);
+
+/// Same as the `LayoutDirection`, but without the `-reverse` properties, used in the layout solver,
+/// makes decisions based on horizontal / vertical direction easier to write.
+/// Use `LayoutDirection::get_axis()` to get the axis for a given `LayoutDirection`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LayoutAxis {
+    Horizontal,
+    Vertical,
+}
+
 /// Represents a `position` attribute - default: `Static`
 ///
 /// NOTE: No inline positioning is supported.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LayoutPosition {
     Static,
     Relative,
@@ -1195,14 +1331,8 @@ impl Default for LayoutPosition {
     }
 }
 
-impl Default for LayoutDirection {
-    fn default() -> Self {
-        LayoutDirection::Column
-    }
-}
-
 /// Represents a `flex-wrap` attribute - default: `Wrap`
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LayoutWrap {
     Wrap,
     NoWrap,
@@ -1215,7 +1345,7 @@ impl Default for LayoutWrap {
 }
 
 /// Represents a `justify-content` attribute
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LayoutJustifyContent {
     /// Default value. Items are positioned at the beginning of the container
     Start,
@@ -1236,7 +1366,7 @@ impl Default for LayoutJustifyContent {
 }
 
 /// Represents a `align-items` attribute
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LayoutAlignItems {
     /// Items are stretched to fit the container
     Stretch,
@@ -1255,7 +1385,7 @@ impl Default for LayoutAlignItems {
 }
 
 /// Represents a `align-content` attribute
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LayoutAlignContent {
     /// Default value. Lines stretch to take up the remaining space
     Stretch,
@@ -1271,55 +1401,10 @@ pub enum LayoutAlignContent {
     SpaceAround,
 }
 
-/// Represents a `overflow` attribute
-///
-/// NOTE: This is split into `NotModified` and `Modified`
-/// in order to be able to "merge" `overflow-x` and `overflow-y`
-/// into one property.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum TextOverflowBehaviour {
-    NotModified,
-    Modified(TextOverflowBehaviourInner),
-}
-
-impl TextOverflowBehaviour {
-    pub fn can_overflow(&self) -> bool {
-        use self::TextOverflowBehaviour::*;
-        use self::TextOverflowBehaviourInner::*;
-        match self {
-            Modified(m) => match m {
-                Scroll | Auto => true,
-                Hidden | Visible => false,
-            },
-            // default: allow horizontal overflow
-            NotModified => false,
-        }
-    }
-
-    pub fn clips_children(&self) -> bool {
-        use self::TextOverflowBehaviour::*;
-        use self::TextOverflowBehaviourInner::*;
-        match self {
-            Modified(m) => match m {
-                Scroll | Auto | Hidden => true,
-                Visible => false,
-            },
-            // default: allow horizontal overflow
-            NotModified => false,
-        }
-    }
-}
-
-impl Default for TextOverflowBehaviour {
-    fn default() -> Self {
-        TextOverflowBehaviour::NotModified
-    }
-}
-
 /// Represents a `overflow-x` or `overflow-y` property, see
 /// [`TextOverflowBehaviour`](./struct.TextOverflowBehaviour.html) - default: `Auto`
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum TextOverflowBehaviourInner {
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Overflow {
     /// Always shows a scroll bar, overflows on scroll
     Scroll,
     /// Does not show a scroll bar by default, only when text is overflowing
@@ -1330,14 +1415,37 @@ pub enum TextOverflowBehaviourInner {
     Visible,
 }
 
-impl Default for TextOverflowBehaviourInner {
+impl Default for Overflow {
     fn default() -> Self {
-        TextOverflowBehaviourInner::Auto
+        Overflow::Auto
+    }
+}
+
+impl Overflow {
+
+    /// Returns whether this overflow value needs to display the scrollbars.
+    ///
+    /// - `overflow:scroll` always shows the scrollbar
+    /// - `overflow:auto` only shows the scrollbar when the content is currently overflowing
+    /// - `overflow:hidden` and `overflow:visible` do not show any scrollbars
+    pub fn needs_scrollbar(&self, currently_overflowing: bool) -> bool {
+        use self::Overflow::*;
+        match self {
+            Scroll => true,
+            Auto => currently_overflowing,
+            Hidden | Visible => false,
+        }
+    }
+
+    /// Returns whether this is an `overflow:visible` node
+    /// (the only overflow type that doesn't clip its children)
+    pub fn is_overflow_visible(&self) -> bool {
+        *self == Overflow::Visible
     }
 }
 
 /// Horizontal text alignment enum (left, center, right) - default: `Center`
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StyleTextAlignmentHorz {
     Left,
     Center,
@@ -1351,7 +1459,7 @@ impl Default for StyleTextAlignmentHorz {
 }
 
 /// Vertical text alignment enum (top, center, bottom) - default: `Center`
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StyleTextAlignmentVert {
     Top,
     Center,
@@ -1364,12 +1472,10 @@ impl Default for StyleTextAlignmentVert {
     }
 }
 
-/// Stylistic options of the rectangle that don't influence the layout
-/// (todo: border-box?)
-#[derive(Default, Debug, Clone, PartialEq, Hash)]
+/// Options of a cascaded (styled) DOM node that are only relevant
+/// for styling and don't affect the layout of the rectangle
+#[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RectStyle {
-    /// Background color of this rectangle
-    pub background_color: Option<StyleBackgroundColor>,
     /// Background size of this rectangle
     pub background_size: Option<StyleBackgroundSize>,
     /// Background repetition
@@ -1390,18 +1496,87 @@ pub struct RectStyle {
     pub font_color: Option<StyleTextColor>,
     /// Text alignment
     pub text_align: Option<StyleTextAlignmentHorz,>,
-    /// Text overflow behaviour
-    pub overflow: Option<LayoutOverflow>,
     /// `line-height` property
     pub line_height: Option<StyleLineHeight>,
-    /// `letter-spacing` property (modifies the width and height)
+    /// `letter-spacing` property
     pub letter_spacing: Option<StyleLetterSpacing>,
+    /// `word-spacing` property
+    pub word_spacing: Option<StyleWordSpacing>,
+    /// `tab-width` property
+    pub tab_width: Option<StyleTabWidth>,
 }
 
 impl_pixel_value!(StyleLetterSpacing);
+impl_pixel_value!(StyleWordSpacing);
 
-// Layout constraints for a given rectangle, such as "width", "min-width", "height", etc.
-#[derive(Default, Debug, Copy, Clone, PartialEq, Hash)]
+impl RectStyle {
+
+    pub fn get_horizontal_scrollbar_style(&self) -> ScrollbarInfo {
+        ScrollbarInfo::default()
+    }
+
+    pub fn get_vertical_scrollbar_style(&self) -> ScrollbarInfo {
+        ScrollbarInfo::default()
+    }
+}
+
+/// Holds info necessary for layouting / styling scrollbars (-webkit-scrollbar)
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ScrollbarInfo {
+    /// Total width (or height for vertical scrollbars) of the scrollbar in pixels
+    pub width: LayoutWidth,
+    /// Padding of the scrollbar tracker, in pixels. The inner bar is `width - padding` pixels wide.
+    pub padding: LayoutPadding,
+    /// Style of the scrollbar background
+    /// (`-webkit-scrollbar` / `-webkit-scrollbar-track` / `-webkit-scrollbar-track-piece` combined)
+    pub track: RectStyle,
+    /// Style of the scrollbar thumbs (the "up" / "down" arrows), (`-webkit-scrollbar-thumb`)
+    pub thumb: RectStyle,
+    /// Styles the directional buttons on the scrollbar (`-webkit-scrollbar-button`)
+    pub button: RectStyle,
+    /// If two scrollbars are present, addresses the (usually) bottom corner
+    /// of the scrollable element, where two scrollbars might meet (`-webkit-scrollbar-corner`)
+    pub corner: RectStyle,
+    /// Addresses the draggable resizing handle that appears above the
+    /// `corner` at the bottom corner of some elements (`-webkit-resizer`)
+    pub resizer: RectStyle,
+}
+
+impl Default for ScrollbarInfo {
+    fn default() -> Self {
+        ScrollbarInfo {
+            width: LayoutWidth(PixelValue::px(17.0)),
+            padding: LayoutPadding {
+                left: Some(PixelValue::px(2.0)),
+                right: Some(PixelValue::px(2.0)),
+                .. Default::default()
+            },
+            track: RectStyle {
+                background: Some(StyleBackground::Color(ColorU {
+                    r: 241, g: 241, b: 241, a: 255
+                })),
+                .. Default::default()
+            },
+            thumb: RectStyle {
+                background: Some(StyleBackground::Color(ColorU {
+                    r: 193, g: 193, b: 193, a: 255
+                })),
+                .. Default::default()
+            },
+            button: RectStyle {
+                background: Some(StyleBackground::Color(ColorU {
+                    r: 163, g: 163, b: 163, a: 255
+                })),
+                .. Default::default()
+            },
+            corner: RectStyle::default(),
+            resizer: RectStyle::default(),
+        }
+    }
+}
+
+/// Options of a cascaded (styled) DOM node that are relevant for constructing the layout of a div
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RectLayout {
 
     pub width: Option<LayoutWidth>,
@@ -1419,6 +1594,7 @@ pub struct RectLayout {
 
     pub padding: Option<LayoutPadding>,
     pub margin: Option<LayoutMargin>,
+    pub overflow: Option<LayoutOverflow>,
 
     pub direction: Option<LayoutDirection>,
     pub wrap: Option<LayoutWrap>,
@@ -1429,21 +1605,54 @@ pub struct RectLayout {
     pub align_content: Option<LayoutAlignContent>,
 }
 
-impl_pixel_value!(LayoutWidth);
+impl RectLayout {
 
+    pub fn get_horizontal_padding(&self) -> f32 {
+        let padding = self.padding.unwrap_or_default();
+        padding.left.map(|l| l.to_pixels()).unwrap_or(0.0)
+        + padding.right.map(|r| r.to_pixels()).unwrap_or(0.0)
+    }
+
+    pub fn get_vertical_padding(&self) -> f32 {
+        let padding = self.padding.unwrap_or_default();
+        padding.bottom.map(|l| l.to_pixels()).unwrap_or(0.0)
+        + padding.top.map(|r| r.to_pixels()).unwrap_or(0.0)
+    }
+
+    pub fn get_horizontal_margin(&self) -> f32 {
+        let margin = self.margin.unwrap_or_default();
+        margin.left.map(|l| l.to_pixels()).unwrap_or(0.0)
+        + margin.right.map(|r| r.to_pixels()).unwrap_or(0.0)
+    }
+
+    pub fn get_vertical_margin(&self) -> f32 {
+        let margin = self.margin.unwrap_or_default();
+        margin.bottom.map(|r| r.to_pixels()).unwrap_or(0.0)
+        + margin.top.map(|l| l.to_pixels()).unwrap_or(0.0)
+    }
+
+    pub fn is_horizontal_overflow_visible(&self) -> bool {
+        self.overflow.unwrap_or_default().is_horizontal_overflow_visible()
+    }
+
+    pub fn is_vertical_overflow_visible(&self) -> bool {
+        self.overflow.unwrap_or_default().is_vertical_overflow_visible()
+    }
+}
+
+impl_pixel_value!(LayoutWidth);
 impl_pixel_value!(LayoutHeight);
 impl_pixel_value!(LayoutMinHeight);
 impl_pixel_value!(LayoutMinWidth);
 impl_pixel_value!(LayoutMaxWidth);
 impl_pixel_value!(LayoutMaxHeight);
-
 impl_pixel_value!(LayoutTop);
 impl_pixel_value!(LayoutBottom);
 impl_pixel_value!(LayoutRight);
 impl_pixel_value!(LayoutLeft);
 
 /// Represents a `font-size` attribute
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StyleFontSize(pub PixelValue);
 
 impl_pixel_value!(StyleFontSize);
@@ -1455,14 +1664,17 @@ impl StyleFontSize {
 }
 
 /// Represents a `font-family` attribute
-#[derive(Debug, PartialEq, Clone, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StyleFontFamily {
     // fonts in order of precedence, i.e. "Webly Sleeky UI", "monospace", etc.
     pub fonts: Vec<FontId>
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
-pub enum FontId {
-    BuiltinFont(String),
-    ExternalFont(String),
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FontId(pub String);
+
+impl FontId {
+    pub fn get_str(&self) -> &str {
+        &self.0
+    }
 }

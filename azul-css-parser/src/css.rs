@@ -6,8 +6,8 @@ use std::{
 pub use simplecss::Error as CssSyntaxError;
 use simplecss::Tokenizer;
 
-use css_parser;
-pub use css_parser::CssParsingError;
+use crate::css_parser;
+pub use crate::css_parser::CssParsingError;
 use azul_css::{
     Css, CssDeclaration, Stylesheet,
     DynamicCssProperty, DynamicCssPropertyDefault,
@@ -161,7 +161,7 @@ fn parse_nth_child_pattern<'a>(value: &'a str) -> Result<CssNthChildSelector, Cs
 
     let offset = match offset_iterator.next() {
         Some(offset_string) => {
-            offset_string.trim();
+            let offset_string = offset_string.trim();
             if offset_string.is_empty() {
                 return Err(CssPseudoSelectorParseError::InvalidNthChildPattern(value));
             } else {
@@ -534,8 +534,8 @@ pub fn parse_dynamic_css_property<'a>(key: CssPropertyType, value: &'a str) -> R
     use std::char;
 
     // "[[ id | 400px ]]" => "id | 400px"
-    let value = value.trim_left_matches(START_BRACE);
-    let value = value.trim_right_matches(END_BRACE);
+    let value = value.trim_start_matches(START_BRACE);
+    let value = value.trim_end_matches(END_BRACE);
     let value = value.trim();
 
     let mut pipe_split = value.splitn(2, "|");
@@ -588,7 +588,7 @@ pub fn parse_dynamic_css_property<'a>(key: CssPropertyType, value: &'a str) -> R
 #[test]
 fn test_detect_static_or_dynamic_property() {
     use azul_css::{CssProperty, StyleTextAlignmentHorz};
-    use css_parser::InvalidValueErr;
+    use crate::css_parser::InvalidValueErr;
     assert_eq!(
         determine_static_or_dynamic_css_property(CssPropertyType::TextAlign, " center   "),
         Ok(CssDeclaration::Static(CssProperty::TextAlign(StyleTextAlignmentHorz::Center)))
@@ -663,7 +663,7 @@ fn test_detect_static_or_dynamic_property() {
 #[test]
 fn test_css_parse_1() {
 
-    use azul_css::{ColorU, StyleBackgroundColor, NodeTypePath, CssProperty};
+    use azul_css::{ColorU, StyleBackground, NodeTypePath, CssProperty};
 
     let parsed_css = new_from_str("
         div#my_id .my_class:first {
@@ -684,7 +684,7 @@ fn test_css_parse_1() {
                     CssPathSelector::PseudoSelector(CssPathPseudoSelector::First),
                 ],
             },
-            declarations: vec![CssDeclaration::Static(CssProperty::BackgroundColor(StyleBackgroundColor(ColorU { r: 255, g: 0, b: 0, a: 255 })))],
+            declarations: vec![CssDeclaration::Static(CssProperty::Background(StyleBackground::Color(ColorU { r: 255, g: 0, b: 0, a: 255 })))],
         }
     ];
 
@@ -729,9 +729,10 @@ mod stylesheet_parse {
     // Tests that an element with a single class always gets the CSS element applied properly
     #[test]
     fn test_apply_css_pure_class() {
-        let red = CssProperty::BackgroundColor(StyleBackgroundColor(ColorU { r: 255, g: 0, b: 0, a: 255 }));
-        let blue = CssProperty::BackgroundColor(StyleBackgroundColor(ColorU { r: 0, g: 0, b: 255, a: 255 }));
-        let black = CssProperty::BackgroundColor(StyleBackgroundColor(ColorU { r: 0, g: 0, b: 0, a: 255 }));
+
+        let red = CssProperty::Background(StyleBackground::Color(ColorU { r: 255, g: 0, b: 0, a: 255 }));
+        let blue = CssProperty::Background(StyleBackground::Color(ColorU { r: 0, g: 0, b: 255, a: 255 }));
+        let black = CssProperty::Background(StyleBackground::Color(ColorU { r: 0, g: 0, b: 0, a: 255 }));
 
         // Simple example
         {

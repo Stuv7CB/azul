@@ -1,39 +1,73 @@
-//! Azul is a free, functional, IMGUI-oriented GUI framework for rapid prototyping
-//! of desktop applications written in Rust, supported by the Mozilla WebRender rendering
-//! engine, using a CSS / DOM model for layout and styling.
+//! Azul is a free, functional, immediate-mode GUI framework for rapid development
+//! of desktop applications written in Rust, supported by the Mozilla WebRender
+//! rendering engine, using a flexbox-based CSS / DOM model for layout and styling.
 //!
-//! ## Concepts
+//! # Concept
 //!
-//! Azul is largely based on the IMGUI principle, in that you redraw the entire
-//! screen every frame. To not make this too performance intensive, Azul provides
-//! diffing and caching, as well as efficient callback handling and hit-testing.
+//! Azul is largely based on the principle of immediate-mode GUI frameworks, which
+//! is that the entire UI (in Azuls case the DOM) is reconstructed and re-rendered
+//! on every frame (instead of having functions that mutate the UI state like
+//! `button.setText()`). This method of constructing UIs has a performance overhead
+//! over methods that retain the UI, therefore Azul only calls the [`Layout::layout()`]
+//! function when its absolutely necessary - inside of a callback, you can return
+//! whether it is necessary to redraw the screen or not (by returning
+//! [`Redraw`] or [`DontRedraw`], respectively).
 //!
-//! Managing your code can be done by creating "widgets", i.e. reusable components
-//! that can register "default callbacks", for example a checkbox that toggles a
-//! certain field if it is checked.
+//! In difference to other immediate-mode frameworks, Azul does not immediately
+//! draw to the screen, but rather "draws" to a `Dom`. This has several advantages,
+//! such as making it possible to layout code at runtime, [loading a `Dom` from
+//! an XML file], recognizing state changes by diffing two frames, as well as being
+//! able to reparent DOMs into almost any configuration to make components reusable
+//! independent of the context they are in.
 //!
-//! Azul also has a standard library of widgets to use, see the [widgets] module.
-//! Further, it provides a library for CSS parsing and handling (which takes care
-//! of the layouting part) as well as DOM handling.
+//! # Development lifecycle
 //!
-//! ## Documentation
+//! A huge problem when working with GUI applications in Rust is managing the
+//! compile time. Having to recompile your entire code when you just want to
+//! shift an element a pixel to the right is not a good developer experience.
+//! Azul has three main methods of combating compile time:
 //!
-//! Explaining all concepts and examples is too much material to be included in
-//! this API reference. Please refer to the [wiki](https://github.com/maps4print/azul/wiki)
-//! or use the links below to learn about how to use Azul.
+//! - The [XML] system, which allows you to load DOMs at runtime [from a file]
+//! - The [CSS] system, which allows you to [load and parse stylesheets]
 //!
-//! - [Getting Started](https://github.com/maps4print/azul/wiki/Getting-Started)
-//! - [A simple counter](https://github.com/maps4print/azul/wiki/A-simple-counter)
-//! - [Styling your app with CSS](https://github.com/maps4print/azul/wiki/Styling-your-application-with-CSS)
-//! - [SVG drawing](https://github.com/maps4print/azul/wiki/SVG-drawing)
-//! - [OpenGL drawing](https://github.com/maps4print/azul/wiki/OpenGL-drawing)
-//! - [Timers, daemons, tasks and async IO](https://github.com/maps4print/azul/wiki/Timers,-daemons,-tasks-and-async-IO)
-//! - [Two-way data binding](https://github.com/maps4print/azul/wiki/Two-way-data-binding)
-//! - [Unit testing](https://github.com/maps4print/azul/wiki/Unit-testing)
+//! Due to Azuls stateless rendering architecutre, hot-reloading also preserves
+//! the current application state. Once you are done layouting your applications
+//! UI, you can [transpile the XML code to valid Rust source code] using [azulc],
+//! the Azul-XML-to-Rust compiler.
 //!
-//! ## Hello world
+//! Please note that the compiler isn't perfect - the XML system is very limited,
+//! and parsing XML has a certain performance overhead, since it's done on every frame.
+//! That is fine for debug builds, but the XML system should not be used in release mode.
 //!
-//! Note: Can currently not be tested on CI, since it opens a graphical window.
+//! When you are done with designing the callbacks of your widget, you may want to
+//! package the widget up to autmatically react to certain events without having the
+//! user of your widget write any code to hook up the callbacks - for this purpose,
+//! Azul features a [two way data binding] system.
+//!
+//! # Custom drawing and embedding external applications
+//!
+//! Azul is mostly concerned with rendering text, images and rectangular boxes (divs).
+//! Any other content can be drawn by drawing to an OpenGL texture (using a
+//! [`GlTextureCallback`]) and handing the texture as an "image" to Azul. This is also how
+//! components like a video player or other OpenGL-based visualizations can exist
+//! outside of the core library and be "injected" into the UI.
+//!
+//! You can draw to an OpenGL texture and hand it to Azul in order to display it
+//! in the UI - the texture doesn't have to come from Azul itself, you can inject
+//! it from an external application.
+//!
+//! # Limitations
+//!
+//! There are a few limitations that should be noted:
+//!
+//! - There are no scrollbars yet. Creating scrollable frames can be done by
+//!   [creating an `IFrameCallback`].
+//! - Similarly, there is no clipping of overflowing content yet - clipping only
+//!   works for `IFrameCallback`s.
+//! - There is no support for CSS animations of any kind yet
+//! - Changing dynamic variables will trigger an entire UI relayout and restyling
+//!
+//! # Hello world
 //!
 //! ```no_run
 //! extern crate azul;
@@ -44,21 +78,50 @@
 //!
 //! impl Layout for MyDataModel {
 //!     fn layout(&self, _: LayoutInfo<Self>) -> Dom<Self> {
-//!         Dom::new(NodeType::Div)
+//!         Dom::label("Hello World")
 //!     }
 //! }
 //!
 //! fn main() {
-//!     let app = App::new(MyDataModel { }, AppConfig::default());
-//!     let window = Window::new(WindowCreateOptions::default(), css::native()).unwrap();
+//!     let mut app = App::new(MyDataModel { }, AppConfig::default()).unwrap();
+//!     let window = app.create_window(WindowCreateOptions::default(), css::native()).unwrap();
 //!     app.run(window).unwrap();
 //! }
 //! ```
 //!
-//! If you run this code, you should get a window like this:
+//! Running this code should return a window similar to this:
 //!
 //! ![Opening a blank window](https://raw.githubusercontent.com/maps4print/azul/master/doc/azul_tutorial_empty_window.png)
 //!
+//! # Tutorials
+//!
+//! Explaining all concepts and examples is too much to be included in
+//! this API reference. Please refer to the [wiki](https://github.com/maps4print/azul/wiki)
+//! or use the links below to learn about how to use Azul.
+//!
+//! - [Getting Started](https://github.com/maps4print/azul/wiki/Getting-Started)
+//! - [A simple counter](https://github.com/maps4print/azul/wiki/A-simple-counter)
+//! - [Styling your app with CSS](https://github.com/maps4print/azul/wiki/Styling-your-application-with-CSS)
+//! - [SVG drawing](https://github.com/maps4print/azul/wiki/SVG-drawing)
+//! - [OpenGL drawing](https://github.com/maps4print/azul/wiki/OpenGL-drawing)
+//! - [Timers, timers, tasks and async IO](https://github.com/maps4print/azul/wiki/Timers,-timers,-tasks-and-async-IO)
+//! - [Two-way data binding](https://github.com/maps4print/azul/wiki/Two-way-data-binding)
+//! - [Unit testing](https://github.com/maps4print/azul/wiki/Unit-testing)
+//!
+//! [`Layout::layout()`]: ../azul/traits/trait.Layout.html
+//! [widgets]: ../azul/widgets/index.html
+//! [loading a `Dom` from an XML file]: ../azul/dom/struct.Dom.html#method.from_file
+//! [XML]: ../azul/xml/index.html
+//! [`Redraw`]: ../azul/callbacks/constant.Redraw.html
+//! [`DontRedraw`]: ../azul/callbacks/constant.DontRedraw.html
+//! [`GlTextureCallback`]: ../azul/callbacks/struct.GlTextureCallback.html
+//! [creating an `IFrameCallback`]: ../azul/dom/struct.Dom.html#method.iframe
+//! [from a file]: ../azul/dom/struct.Dom.html#method.from_file
+//! [CSS]: ../azul/css/index.html
+//! [load and parse stylesheets]: ../azul/css/fn.from_str.html
+//! [transpile the XML code to valid Rust source code]: https://github.com/maps4print/azul/wiki/XML-to-Rust-compilation
+//! [azulc]: https://crates.io/crates/azulc
+//! [two way data binding]: https://github.com/maps4print/azul/wiki/Two-way-data-binding
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/maps4print/azul/master/assets/images/azul_logo_full_min.svg.png",
@@ -69,6 +132,7 @@
 #![deny(unreachable_patterns)]
 #![deny(missing_copy_implementations)]
 #![allow(dead_code)]
+#![deny(clippy::all)]
 
 #[macro_use(warn, error, lazy_static)]
 #[cfg_attr(feature = "svg", macro_use(implement_vertex, uniform))]
@@ -84,13 +148,13 @@ pub(crate) use azul_dependencies::glium as glium;
 pub(crate) use azul_dependencies::gleam as gleam;
 pub(crate) use azul_dependencies::euclid;
 pub(crate) use azul_dependencies::webrender;
-pub(crate) use azul_dependencies::rusttype;
 pub(crate) use azul_dependencies::app_units;
 pub(crate) use azul_dependencies::unicode_normalization;
 pub(crate) use azul_dependencies::tinyfiledialogs;
 pub(crate) use azul_dependencies::clipboard2;
 pub(crate) use azul_dependencies::font_loader;
 pub(crate) use azul_dependencies::xmlparser;
+pub(crate) use azul_dependencies::harfbuzz_sys;
 
 #[cfg(feature = "logging")]
 pub(crate) use azul_dependencies::log;
@@ -109,58 +173,45 @@ pub(crate) use azul_dependencies::usvg;
 #[cfg(feature = "faster-hashing")]
 pub(crate) use azul_dependencies::twox_hash;
 
-// #[cfg(not(target_os = "linux"))]
-// use azul_dependencies::nfd;
-
-#[cfg(feature = "css-parser")]
+#[cfg(feature = "css_parser")]
 extern crate azul_css;
 extern crate azul_native_style;
 extern crate azul_css_parser;
 
+// Crate-internal macros
 #[macro_use]
 mod macros;
 
-/// Global application state, wrapping resources and app state
+/// Manages application state (`App` / `AppState` / `AppResources`), wrapping resources and app state
 pub mod app;
-/// Focus tracking / input tracking related functions
-pub mod focus;
-/// Wrapper for the application data & application state
-pub mod app_state;
-/// Font & image resource handling, lookup and caching
-pub mod app_resources;
-#[cfg(any(feature = "css-parser", feature = "native-style"))]
+/// Async IO helpers / (`Task` / `Timer` / `Thread`)
+pub mod async;
+/// Type definitions for various types of callbacks, as well as focus and scroll handling
+pub mod callbacks;
+/// CSS type definitions / CSS parsing functions
+#[cfg(any(feature = "css_parser", feature = "native_style"))]
 pub mod css;
-/// Daemon / timer system
-pub mod daemon;
-/// XML-based DOM serialization
-pub mod xml;
-/// Handles default callbacks (such as an automatic text field update) via unsafe code
-pub mod default_callbacks;
 /// Bindings to the native file-chooser, color picker, etc. dialogs
 pub mod dialogs;
 /// DOM / HTML node handling
 pub mod dom;
 /// Re-exports of errors
 pub mod error;
-/// Font handling
-pub mod font;
-/// Async IO / task system
-pub mod task;
-/// Module for caching long texts (including their layout / character positions) across multiple frames
-pub mod text_cache;
-/// Text layout helper functions - useful for text layout outside of standard containers
+/// Handles text layout (modularized, can be used as a standalone module)
 pub mod text_layout;
-/// The layout traits for creating a layout-able application
+/// Main `Layout` trait definition + convenience traits for `Arc<Mutex<T>>`
 pub mod traits;
-/// Built-in widgets
+/// Container for default widgets (`TextInput` / `Button` / `Label`, `TableView`, ...)
 pub mod widgets;
-/// Window handling
+/// Window state handling and window-related information
 pub mod window;
-/// Window state handling, event filtering
-pub mod window_state;
+/// XML-based DOM serialization and XML-to-Rust compiler implementation
+pub mod xml;
 
 /// UI Description & display list handling (webrender)
 mod ui_description;
+/// HarfBuzz text shaping utilities
+mod text_shaping;
 /// Converts the UI description (the styled HTML nodes)
 /// to an actual display list (+ layout)
 mod display_list;
@@ -168,8 +219,6 @@ mod display_list;
 mod id_tree;
 /// State handling for user interfaces
 mod ui_state;
-/// Image handling
-mod images;
 /// The compositor takes all textures (user-defined + the UI texture(s)) and draws them on
 /// top of each other
 mod compositor;
@@ -180,6 +229,24 @@ mod logging;
 mod ui_solver;
 /// DOM styling module
 mod style;
+/// DOM diffing
+mod diff;
+/// Checks that two-way bound values are on the stack
+mod stack_checked_pointer;
+/// Window state handling and diffing
+mod window_state;
+/// ImageId / FontId handling and caching
+mod app_resources;
+
+/// Font & image resource handling, lookup and caching
+pub mod resources {
+    // re-export everything *except* the AppResources (which are exported under the "app" module)
+    pub use app_resources::{
+        FontId, ImageId, LoadedFont, RawImage, FontReloadError, FontSource, ImageReloadError,
+        ImageSource, RawImageFormat, CssFontId, CssImageId,
+        TextCache, TextId,
+    };
+}
 
 // Faster implementation of a HashMap (optional, disabled by default, turn on with --feature="faster-hashing")
 
@@ -194,39 +261,39 @@ type FastHashSet<T> = ::std::collections::HashSet<T>;
 
 /// Quick exports of common types
 pub mod prelude {
-    pub use azul_css::ColorU;
-    pub use app::{App, AppConfig};
-    pub use app_state::AppState;
+    #[cfg(feature = "css_parser")]
+    pub use azul_css::*;
+    pub use app::{App, AppConfig, AppState, AppResources};
+    pub use async::{Task, TerminateTimer, TimerId, Timer, DropCheck};
+    pub use resources::{
+        RawImageFormat, ImageId, FontId, FontSource, ImageSource,
+        TextCache, TextId,
+    };
+    pub use callbacks::{
+        Callback, TimerCallback, IFrameCallback, GlTextureCallback,
+        UpdateScreen, Redraw, DontRedraw,
+        CallbackInfo, FocusTarget, LayoutInfo, HidpiAdjustedBounds, Texture,
+    };
     pub use dom::{
-        Dom, DomHash, NodeType, NodeData, Callback, On,
-        UpdateScreen, Redraw, DontRedraw, Texture, GlTextureCallback,
-        IFrameCallback, TabIndex, EventFilter, HoverEventFilter, FocusEventFilter,
-        NotEventFilter, WindowEventFilter, DesktopEventFilter,
+        Dom, DomHash, NodeType, NodeData, On, DomString, TabIndex,
+        EventFilter, HoverEventFilter, FocusEventFilter, NotEventFilter, WindowEventFilter,
     };
     pub use traits::{Layout, Modify};
     pub use window::{
-        MonitorIter, Window, WindowCreateOptions, WindowId,
-        MouseMode, UpdateBehaviour, UpdateMode, HidpiAdjustedBounds,
-        WindowMonitorTarget, RendererType, CallbackInfo, LayoutInfo, ReadOnlyWindow
+        MonitorIter, Window, WindowCreateOptions,
+        WindowMonitorTarget, RendererType, ReadOnlyWindow
     };
     pub use window_state::{WindowState, KeyboardState, MouseState, DebugState, keymap, AcceleratorKey};
-    pub use images::ImageId;
-    pub use text_cache::{TextCache, TextId};
     pub use glium::glutin::{
         dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize},
         VirtualKeyCode, ScanCode, Icon,
     };
-    pub use azul_css::*;
-    pub use rusttype::Font;
-    pub use app_resources::{AppResources, RawImageFormat};
-    pub use daemon::{TerminateDaemon, DaemonId, DaemonCallback, Daemon};
-    pub use default_callbacks::StackCheckedPointer;
+    pub use stack_checked_pointer::StackCheckedPointer;
     pub use text_layout::{TextLayoutOptions, GlyphInstance};
-    pub use task::Task;
     pub use xml::{XmlComponent, XmlComponentMap};
-    #[cfg(any(feature = "css-parser", feature = "native-style"))]
-    pub use css;
 
+    #[cfg(any(feature = "css_parser", feature = "native_style"))]
+    pub use css;
     #[cfg(feature = "logging")]
     pub use log::LevelFilter;
 }

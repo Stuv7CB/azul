@@ -1,17 +1,17 @@
 //! Contains utilities to convert strings (CSS strings) to servo types
 
-use std::{fmt, num::{ParseIntError, ParseFloatError}};
+use std::num::{ParseIntError, ParseFloatError};
 use azul_css::{
     CssPropertyType,
-    StyleTextAlignmentHorz, TextOverflowBehaviour, TextOverflowBehaviourInner,
+    StyleTextAlignmentHorz, Overflow,
     LayoutAlignItems, LayoutAlignContent, LayoutJustifyContent, Shape,
     LayoutWrap, LayoutDirection, LayoutPosition, CssProperty, LayoutOverflow,
     StyleFontFamily, StyleFontSize, StyleLineHeight, LayoutFlexShrink, LayoutFlexGrow,
-    LayoutLeft, LayoutRight, LayoutTop, LayoutBottom, StyleCursor,
+    LayoutLeft, LayoutRight, LayoutTop, LayoutBottom, StyleCursor, StyleWordSpacing, StyleTabWidth,
     LayoutMaxHeight, LayoutMinHeight, LayoutHeight, LayoutMaxWidth, LayoutMinWidth, LayoutWidth,
     StyleBorderRadius, PixelValue, PercentageValue, FloatValue,
     ColorU, LayoutMargin, StyleLetterSpacing, StyleTextColor, StyleBackground, StyleBoxShadow,
-    GradientStopPre, RadialGradient, StyleBackgroundColor, StyleBackgroundSize, StyleBackgroundRepeat,
+    GradientStopPre, RadialGradient, StyleBackgroundSize, StyleBackgroundRepeat,
     DirectionCorner, StyleBorder, Direction, CssImageId, LinearGradient,
     BoxShadowPreDisplayItem, BorderStyle, LayoutPadding, StyleBorderSide, BorderRadius, PixelSize,
     BackgroundType,
@@ -21,10 +21,23 @@ use azul_css::{
 
 /// A parser that can accept a list of items and mappings
 macro_rules! multi_type_parser {
-    ($fn:ident, $return:ident, $([$identifier_string:expr, $enum_type:ident]),+) => (
+    ($fn:ident, $return_str:expr, $return:ident, $import_str:expr, $([$identifier_string:expr, $enum_type:ident, $parse_str:expr]),+) => {
+        #[doc = "Parses a `"]
+        #[doc = $return_str]
+        #[doc = "` attribute from a `&str`"]
+        #[doc = ""]
+        #[doc = "# Example"]
+        #[doc = ""]
+        #[doc = "```rust"]
+        #[doc = $import_str]
+        $(
+            #[doc = $parse_str]
+        )+
+        #[doc = "```"]
         pub fn $fn<'a>(input: &'a str)
         -> Result<$return, InvalidValueErr<'a>>
         {
+            let input = input.trim();
             match input {
                 $(
                     $identifier_string => Ok($return::$enum_type),
@@ -32,17 +45,50 @@ macro_rules! multi_type_parser {
                 _ => Err(InvalidValueErr(input)),
             }
         }
-    )
+    };
+    ($fn:ident, $return:ident, $([$identifier_string:expr, $enum_type:ident]),+) => {
+        multi_type_parser!($fn, stringify!($return), $return,
+            concat!(
+                "# extern crate azul_css;", "\r\n",
+                "# extern crate azul_css_parser;", "\r\n",
+                "# use azul_css_parser::", stringify!($fn), ";", "\r\n",
+                "# use azul_css::", stringify!($return), ";"
+            ),
+            $([
+                $identifier_string, $enum_type,
+                concat!("assert_eq!(", stringify!($fn), "(\"", $identifier_string, "\"), Ok(", stringify!($return), "::", stringify!($enum_type), "));")
+            ]),+
+        );
+    };
 }
 
 macro_rules! typed_pixel_value_parser {
-    ($fn:ident, $return:ident) => (
-        pub fn $fn<'a>(input: &'a str)
-        -> Result<$return, PixelParseError<'a>>
-        {
+    ($fn:ident, $fn_str:expr, $return:ident, $return_str:expr, $import_str:expr, $test_str:expr) => {
+        #[doc = "Parses a `"]
+        #[doc = $return_str]
+        #[doc = "` attribute from a `&str`"]
+        #[doc = ""]
+        #[doc = "# Example"]
+        #[doc = ""]
+        #[doc = "```rust"]
+        #[doc = $import_str]
+        #[doc = $test_str]
+        #[doc = "```"]
+        pub fn $fn<'a>(input: &'a str) -> Result<$return, PixelParseError<'a>> {
             parse_pixel_value(input).and_then(|e| Ok($return(e)))
         }
-    )
+    };
+    ($fn:ident, $return:ident) => {
+        typed_pixel_value_parser!($fn, stringify!($fn), $return, stringify!($return),
+            concat!(
+                "# extern crate azul_css;", "\r\n",
+                "# extern crate azul_css_parser;", "\r\n",
+                "# use azul_css_parser::", stringify!($fn), ";", "\r\n",
+                "# use azul_css::{PixelValue, ", stringify!($return), "};"
+            ),
+            concat!("assert_eq!(", stringify!($fn), "(\"5px\"), Ok(", stringify!($return), "(PixelValue::px(5.0))));")
+        );
+    };
 }
 
 /// Main parsing function, takes a stringified key / value pair and either
@@ -62,15 +108,19 @@ pub fn parse_key_value_pair<'a>(key: CssPropertyType, value: &'a str) -> Result<
     use self::CssPropertyType::*;
     let value = value.trim();
     match key {
-        BorderRadius     => Ok(parse_style_border_radius(value)?.into()),
-        BackgroundColor  => Ok(parse_style_background_color(value)?.into()),
+        Background       => Ok(parse_style_background(value)?.into()),
+        BackgroundColor  => Ok(StyleBackground::Color(parse_css_color(value)?).into()),
+        BackgroundImage  => Ok(StyleBackground::Image(parse_image(value)?).into()),
         BackgroundSize   => Ok(parse_style_background_size(value)?.into()),
         BackgroundRepeat => Ok(parse_style_background_repeat(value)?.into()),
+
         TextColor        => Ok(parse_style_text_color(value)?.into()),
-        Background       => Ok(parse_style_background(value)?.into()),
+        BorderRadius     => Ok(parse_style_border_radius(value)?.into()),
         FontSize         => Ok(parse_style_font_size(value)?.into()),
         FontFamily       => Ok(parse_style_font_family(value)?.into()),
         LetterSpacing    => Ok(parse_style_letter_spacing(value)?.into()),
+        WordSpacing      => Ok(parse_style_word_spacing(value)?.into()),
+        TabWidth         => Ok(parse_style_tab_width(value)?.into()),
         LineHeight       => Ok(parse_style_line_height(value)?.into()),
         Cursor           => Ok(parse_style_cursor(value)?.into()),
 
@@ -124,31 +174,31 @@ pub fn parse_key_value_pair<'a>(key: CssPropertyType, value: &'a str) -> Result<
         Overflow         => {
             let overflow_both_directions = parse_layout_text_overflow(value)?;
             Ok(LayoutOverflow {
-                horizontal: TextOverflowBehaviour::Modified(overflow_both_directions),
-                vertical: TextOverflowBehaviour::Modified(overflow_both_directions),
+                horizontal: Some(overflow_both_directions),
+                vertical: Some(overflow_both_directions),
             }.into())
         },
         OverflowX        => {
             let overflow_x = parse_layout_text_overflow(value)?;
             Ok(LayoutOverflow {
-                horizontal: TextOverflowBehaviour::Modified(overflow_x),
-                vertical: TextOverflowBehaviour::default(),
+                horizontal: Some(overflow_x),
+                vertical: None,
             }.into())
         },
         OverflowY        => {
             let overflow_y = parse_layout_text_overflow(value)?;
             Ok(LayoutOverflow {
-                horizontal: TextOverflowBehaviour::default(),
-                vertical: TextOverflowBehaviour::Modified(overflow_y),
+                horizontal: None,
+                vertical: Some(overflow_y),
             }.into())
-        }
+        },
     }
 }
 
 /// Error containing all sub-errors that could happen during CSS parsing
 ///
 /// Usually we want to crash on the first error, to notify the user of the problem.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum CssParsingError<'a> {
     CssBorderParseError(CssBorderParseError<'a>),
     CssShadowParseError(CssShadowParseError<'a>),
@@ -166,6 +216,7 @@ pub enum CssParsingError<'a> {
     FlexGrowParseError(FlexGrowParseError<'a>),
 }
 
+impl_debug_as_display!(CssParsingError<'a>);
 impl_display!{ CssParsingError<'a>, {
     CssStyleBorderRadiusParseError(e) => format!("Invalid border-radius: {}", e),
     CssBorderParseError(e) => format!("Invalid border property: {}", e),
@@ -207,12 +258,13 @@ impl<'a> From<PercentageParseError> for CssParsingError<'a> {
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct InvalidValueErr<'a>(pub &'a str);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 pub enum CssStyleBorderRadiusParseError<'a> {
     TooManyValues(&'a str),
     PixelParseError(PixelParseError<'a>),
 }
 
+impl_debug_as_display!(CssStyleBorderRadiusParseError<'a>);
 impl_display!{ CssStyleBorderRadiusParseError<'a>, {
     TooManyValues(val) => format!("Too many values: \"{}\"", val),
     PixelParseError(e) => format!("{}", e),
@@ -231,7 +283,7 @@ pub enum CssColorComponent {
     Alpha,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum CssColorParseError<'a> {
     InvalidColor(&'a str),
     InvalidFunctionName(&'a str),
@@ -248,26 +300,22 @@ pub enum CssColorParseError<'a> {
     InvalidPercentage(PercentageParseError),
 }
 
-impl<'a> fmt::Display for CssColorParseError<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::CssColorParseError::*;
-        match self {
-            InvalidColor(i) => write!(f, "Invalid CSS color: \"{}\"", i),
-            InvalidFunctionName(i) => write!(f, "Invalid function name, expected one of: \"rgb\", \"rgba\", \"hsl\", \"hsla\" got: \"{}\"", i),
-            InvalidColorComponent(i) => write!(f, "Invalid color component when parsing CSS color: \"{}\"", i),
-            IntValueParseErr(e) => write!(f, "CSS color component: Value not in range between 00 - FF: \"{}\"", e),
-            FloatValueParseErr(e) => write!(f, "CSS color component: Value cannot be parsed as floating point number: \"{}\"", e),
-            FloatValueOutOfRange(v) => write!(f, "CSS color component: Value not in range between 0.0 - 1.0: \"{}\"", v),
-            MissingColorComponent(c) => write!(f, "CSS color is missing {:?} component", c),
-            ExtraArguments(a) => write!(f, "Extra argument to CSS color: \"{}\"", a),
-            EmptyInput => write!(f, "Empty color string."),
-            UnclosedColor(i) => write!(f, "Unclosed color: \"{}\"", i),
-            DirectionParseError(e) => write!(f, "Could not parse direction argument for CSS color: \"{}\"", e),
-            UnsupportedDirection(d) => write!(f, "Unsupported direction type for CSS color: \"{}\"", d),
-            InvalidPercentage(p) => write!(f, "Invalid percentage when parsing CSS color: \"{}\"", p),
-        }
-    }
-}
+impl_debug_as_display!(CssColorParseError<'a>);
+impl_display!{CssColorParseError<'a>, {
+    InvalidColor(i) => format!("Invalid CSS color: \"{}\"", i),
+    InvalidFunctionName(i) => format!("Invalid function name, expected one of: \"rgb\", \"rgba\", \"hsl\", \"hsla\" got: \"{}\"", i),
+    InvalidColorComponent(i) => format!("Invalid color component when parsing CSS color: \"{}\"", i),
+    IntValueParseErr(e) => format!("CSS color component: Value not in range between 00 - FF: \"{}\"", e),
+    FloatValueParseErr(e) => format!("CSS color component: Value cannot be parsed as floating point number: \"{}\"", e),
+    FloatValueOutOfRange(v) => format!("CSS color component: Value not in range between 0.0 - 1.0: \"{}\"", v),
+    MissingColorComponent(c) => format!("CSS color is missing {:?} component", c),
+    ExtraArguments(a) => format!("Extra argument to CSS color: \"{}\"", a),
+    EmptyInput => format!("Empty color string."),
+    UnclosedColor(i) => format!("Unclosed color: \"{}\"", i),
+    DirectionParseError(e) => format!("Could not parse direction argument for CSS color: \"{}\"", e),
+    UnsupportedDirection(d) => format!("Unsupported direction type for CSS color: \"{}\"", d),
+    InvalidPercentage(p) => format!("Invalid percentage when parsing CSS color: \"{}\"", p),
+}}
 
 impl<'a> From<ParseIntError> for CssColorParseError<'a> {
     fn from(e: ParseIntError) -> Self {
@@ -283,17 +331,19 @@ impl<'a> From<ParseFloatError> for CssColorParseError<'a> {
 
 impl_from!(CssDirectionParseError<'a>, CssColorParseError::DirectionParseError);
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq)]
 pub enum CssImageParseError<'a> {
     UnclosedQuotes(&'a str),
 }
 
+impl_debug_as_display!(CssImageParseError<'a>);
 impl_display!{CssImageParseError<'a>, {
     UnclosedQuotes(e) => format!("Unclosed quotes: \"{}\"", e),
 }}
 
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub struct UnclosedQuotesError<'a>(pub(crate) &'a str);
+/// String has unbalanced `'` or `"` quotation marks
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
+pub struct UnclosedQuotesError<'a>(pub &'a str);
 
 impl<'a> From<UnclosedQuotesError<'a>> for CssImageParseError<'a> {
     fn from(err: UnclosedQuotesError<'a>) -> Self {
@@ -301,29 +351,31 @@ impl<'a> From<UnclosedQuotesError<'a>> for CssImageParseError<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum CssBorderParseError<'a> {
+    MissingThickness(&'a str),
     InvalidBorderStyle(InvalidValueErr<'a>),
     InvalidBorderDeclaration(&'a str),
     ThicknessParseError(PixelParseError<'a>),
     ColorParseError(CssColorParseError<'a>),
 }
-
+impl_debug_as_display!(CssBorderParseError<'a>);
 impl_display!{ CssBorderParseError<'a>, {
+    MissingThickness(e) => format!("Missing border thickness: \"{}\"", e),
     InvalidBorderStyle(e) => format!("Invalid style: {}", e.0),
     InvalidBorderDeclaration(e) => format!("Invalid declaration: \"{}\"", e),
     ThicknessParseError(e) => format!("Invalid thickness: {}", e),
     ColorParseError(e) => format!("Invalid color: {}", e),
 }}
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum CssShadowParseError<'a> {
     InvalidSingleStatement(&'a str),
     TooManyComponents(&'a str),
     ValueParseErr(PixelParseError<'a>),
     ColorParseError(CssColorParseError<'a>),
 }
-
+impl_debug_as_display!(CssShadowParseError<'a>);
 impl_display!{ CssShadowParseError<'a>, {
     InvalidSingleStatement(e) => format!("Invalid single statement: \"{}\"", e),
     TooManyComponents(e) => format!("Too many components: \"{}\"", e),
@@ -404,49 +456,62 @@ pub fn parse_style_border_radius<'a>(input: &'a str)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 pub enum PixelParseError<'a> {
-    InvalidComponent(&'a str),
-    ValueParseErr(ParseFloatError),
+    EmptyString,
+    NoValueGiven(&'a str),
+    UnsupportedMetric(f32, String, &'a str),
+    ValueParseErr(ParseFloatError, String),
 }
 
+impl_debug_as_display!(PixelParseError<'a>);
+
 impl_display!{ PixelParseError<'a>, {
-    InvalidComponent(component) => format!("Invalid component: \"{}\"", component),
-    ValueParseErr(e) => format!("Unexpected value: \"{}\"", e),
+    EmptyString => format!("Missing [px / pt / em] value"),
+    NoValueGiven(input) => format!("Expected floating-point pixel value, got: \"{}\"", input),
+    UnsupportedMetric(_, metric, input) => format!("Could not parse \"{}\": Metric \"{}\" is not (yet) implemented.", input, metric),
+    ValueParseErr(err, number_str) => format!("Could not parse \"{}\" as floating-point value: \"{}\"", number_str, err),
 }}
 
 /// parse a single value such as "15px"
 pub fn parse_pixel_value<'a>(input: &'a str)
 -> Result<PixelValue, PixelParseError<'a>>
 {
-    let mut split_pos = 0;
-    for (idx, ch) in input.char_indices() {
-        if ch.is_numeric() || ch == '.' {
-            split_pos = idx;
-        }
+    let input = input.trim();
+
+    if input.is_empty() {
+        return Err(PixelParseError::EmptyString);
     }
 
-    split_pos += 1;
+    let is_part_of_number = |ch: &char| ch.is_numeric() || *ch == '.' || *ch == '-';
 
-    let unit = &input[split_pos..];
-    let unit = match unit {
+    // You can't sub-string pixel values, have to call collect() here!
+    let number_str = input.chars().take_while(is_part_of_number).collect::<String>();
+    let unit_str = input.chars().filter(|ch| !is_part_of_number(ch)).collect::<String>();
+
+    if number_str.is_empty() {
+        return Err(PixelParseError::NoValueGiven(input));
+    }
+
+    let number = number_str.parse::<f32>().map_err(|e| PixelParseError::ValueParseErr(e, number_str))?;
+
+    let unit = match unit_str.as_str() {
         "px" => SizeMetric::Px,
         "em" => SizeMetric::Em,
         "pt" => SizeMetric::Pt,
-        _ => { return Err(PixelParseError::InvalidComponent(&input[(split_pos - 1)..])); }
+        _ => return Err(PixelParseError::UnsupportedMetric(number, unit_str, input)),
     };
-
-    let number = input[..split_pos].parse::<f32>().map_err(|e| PixelParseError::ValueParseErr(e))?;
 
     Ok(PixelValue::from_metric(unit, number))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum PercentageParseError {
     ValueParseErr(ParseFloatError),
     NoPercentSign
 }
 
+impl_debug_as_display!(PercentageParseError);
 impl_from!(ParseFloatError, PercentageParseError::ValueParseErr);
 
 impl_display! { PercentageParseError, {
@@ -515,12 +580,6 @@ pub fn parse_float_value(input: &str)
 -> Result<FloatValue, ParseFloatError>
 {
     Ok(FloatValue::new(input.trim().parse::<f32>()?))
-}
-
-pub fn parse_style_background_color<'a>(input: &'a str)
--> Result<StyleBackgroundColor, CssColorParseError<'a>>
-{
-    parse_css_color(input).and_then(|ok| Ok(StyleBackgroundColor(ok)))
 }
 
 pub fn parse_style_text_color<'a>(input: &'a str)
@@ -1031,6 +1090,33 @@ pub fn parse_layout_margin<'a>(input: &'a str)
 parse_tblr!(border_parser, StyleBorder, CssBorderParseError, parse_css_border);
 
 const DEFAULT_BORDER_COLOR: ColorU = ColorU { r: 0, g: 0, b: 0, a: 255 };
+// Default border thickness on the web seems to be 3px
+const DEFAULT_BORDER_THICKNESS: PixelValue = PixelValue::const_px(3);
+
+use std::str::CharIndices;
+
+fn advance_until_next_char(iter: &mut CharIndices) -> Option<usize> {
+    let mut next_char = iter.next()?;
+    while next_char.1.is_whitespace() {
+        match iter.next() {
+            Some(s) => next_char = s,
+            None => return Some(next_char.0 + 1),
+        }
+    }
+    Some(next_char.0)
+}
+
+/// Advances a CharIndices iterator until the next space is encountered
+fn take_until_next_whitespace(iter: &mut CharIndices) -> Option<usize> {
+    let mut next_char = iter.next()?;
+    while !next_char.1.is_whitespace() {
+        match iter.next() {
+            Some(s) => next_char = s,
+            None => return Some(next_char.0 + 1),
+        }
+    }
+    Some(next_char.0)
+}
 
 /// Parse a CSS border such as
 ///
@@ -1038,32 +1124,44 @@ const DEFAULT_BORDER_COLOR: ColorU = ColorU { r: 0, g: 0, b: 0, a: 255 };
 pub fn parse_css_border<'a>(input: &'a str)
 -> Result<StyleBorderSide, CssBorderParseError<'a>>
 {
-    // Default border thickness on the web seems to be 3px
-    const DEFAULT_BORDER_THICKNESS: f32 = 3.0;
+    use self::CssBorderParseError::*;
 
-    let mut input_iter = input.split_whitespace();
+    let input = input.trim();
 
-    let (border_width, border_style, border_color);
+    // The first argument can either be a style or a pixel value
 
-    match input_iter.clone().count() {
-        1 => {
-            border_style = parse_border_style(input_iter.next().unwrap())
-                            .map_err(|e| CssBorderParseError::InvalidBorderStyle(e))?;
-            border_width = PixelValue::px(DEFAULT_BORDER_THICKNESS);
-            border_color = DEFAULT_BORDER_COLOR;
+    let mut char_iter = input.char_indices();
+    let first_arg_end = take_until_next_whitespace(&mut char_iter).ok_or(MissingThickness(input))?;
+    let first_arg_str = &input[0..first_arg_end];
+
+    advance_until_next_char(&mut char_iter);
+
+    let second_argument_end = take_until_next_whitespace(&mut char_iter);
+    let (border_width, border_width_str_end, border_style);
+
+    match second_argument_end {
+        None => {
+            // First argument is the one and only argument, therefore has to be a style such as "double"
+            border_style = parse_border_style(first_arg_str).map_err(|e| InvalidBorderStyle(e))?;
+            return Ok(StyleBorderSide {
+                border_style,
+                border_width: DEFAULT_BORDER_THICKNESS,
+                border_color: DEFAULT_BORDER_COLOR,
+            });
         },
-        3 => {
-            border_width = parse_pixel_value(input_iter.next().unwrap())
-                           .map_err(|e| CssBorderParseError::ThicknessParseError(e))?;
-            border_style = parse_border_style(input_iter.next().unwrap())
-                           .map_err(|e| CssBorderParseError::InvalidBorderStyle(e))?;
-            border_color = parse_css_color(input_iter.next().unwrap())
-                           .map_err(|e| CssBorderParseError::ColorParseError(e))?;
-       },
-       _ => {
-            return Err(CssBorderParseError::InvalidBorderDeclaration(input));
-       }
+        Some(end) => {
+            // First argument is a pixel value, second argument is the border style
+            border_width = parse_pixel_value(first_arg_str).map_err(|e| ThicknessParseError(e))?;
+            let border_style_str = &input[first_arg_end..end];
+            border_style = parse_border_style(border_style_str).map_err(|e| InvalidBorderStyle(e))?;
+            border_width_str_end = end;
+        }
     }
+
+    let border_color_str = &input[border_width_str_end..];
+
+    // Last argument can be either a hex color or a rgb str
+    let border_color = parse_css_color(border_color_str).map_err(|e| ColorParseError(e))?;
 
     Ok(StyleBorderSide {
         border_width,
@@ -1072,9 +1170,6 @@ pub fn parse_css_border<'a>(input: &'a str)
     })
 }
 
-/// Parse a border style such as "none", "dotted", etc.
-///
-/// "solid", "none", etc.
 multi_type_parser!(parse_border_style, BorderStyle,
     ["none", None],
     ["solid", Solid],
@@ -1201,7 +1296,7 @@ pub fn parse_css_box_shadow<'a>(input: &'a str)
     Ok(Some(box_shadow))
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum CssBackgroundParseError<'a> {
     Error(&'a str),
     InvalidBackground(ParenthesisParseError<'a>),
@@ -1212,18 +1307,21 @@ pub enum CssBackgroundParseError<'a> {
     GradientParseError(CssGradientStopParseError<'a>),
     ShapeParseError(CssShapeParseError<'a>),
     ImageParseError(CssImageParseError<'a>),
+    ColorParseError(CssColorParseError<'a>),
 }
 
+impl_debug_as_display!(CssBackgroundParseError<'a>);
 impl_display!{ CssBackgroundParseError<'a>, {
     Error(e) => e,
     InvalidBackground(val) => format!("Invalid background value: \"{}\"", val),
     UnclosedGradient(val) => format!("Unclosed gradient: \"{}\"", val),
     NoDirection(val) => format!("Gradient has no direction: \"{}\"", val),
-    TooFewGradientStops(val) => format!("Too few gradient-stops: \"{}\"", val),
-    DirectionParseError(e) => format!("Could not parse gradient direction: \"{}\"", e),
-    GradientParseError(e) => format!("Gradient parse error: {}", e),
-    ShapeParseError(e) => format!("Shape parse error: {}", e),
-    ImageParseError(e) => format!("Image parse error: {}", e),
+    TooFewGradientStops(val) => format!("Failed to parse gradient due to too few gradient steps: \"{}\"", val),
+    DirectionParseError(e) => format!("Failed to parse gradient direction: \"{}\"", e),
+    GradientParseError(e) => format!("Failed to parse gradient: {}", e),
+    ShapeParseError(e) => format!("Failed to parse shape of radial gradient: {}", e),
+    ImageParseError(e) => format!("Failed to parse image() value: {}", e),
+    ColorParseError(e) => format!("Failed to parse color value: {}", e),
 }}
 
 impl_from!(ParenthesisParseError<'a>, CssBackgroundParseError::InvalidBackground);
@@ -1231,27 +1329,33 @@ impl_from!(CssDirectionParseError<'a>, CssBackgroundParseError::DirectionParseEr
 impl_from!(CssGradientStopParseError<'a>, CssBackgroundParseError::GradientParseError);
 impl_from!(CssShapeParseError<'a>, CssBackgroundParseError::ShapeParseError);
 impl_from!(CssImageParseError<'a>, CssBackgroundParseError::ImageParseError);
+impl_from!(CssColorParseError<'a>, CssBackgroundParseError::ColorParseError);
 
 // parses a background, such as "linear-gradient(red, green)"
 pub fn parse_style_background<'a>(input: &'a str)
 -> Result<StyleBackground, CssBackgroundParseError<'a>>
 {
-    let (background_type, brace_contents) = parse_parentheses(input, &[
+    match parse_parentheses(input, &[
         "none", "linear-gradient", "repeating-linear-gradient",
-        "radial-gradient", "repeating-radial-gradient", "image"
-    ])?;
+        "radial-gradient", "repeating-radial-gradient", "image",
+    ]) {
+        Ok((background_type, brace_contents)) => {
+            let background_type = match background_type {
+                "none" => { return Ok(StyleBackground::NoBackground); },
+                "linear-gradient" => BackgroundType::LinearGradient,
+                "repeating-linear-gradient" => BackgroundType::RepeatingLinearGradient,
+                "radial-gradient" => BackgroundType::RadialGradient,
+                "repeating-radial-gradient" => BackgroundType::RepeatingRadialGradient,
+                "image" => BackgroundType::Image,
+                _ => { return Ok(StyleBackground::NoBackground); /* unreachable */ },
+            };
 
-    let background_type = match background_type {
-        "none" => { return Ok(StyleBackground::NoBackground); },
-        "linear-gradient" => BackgroundType::LinearGradient,
-        "repeating-linear-gradient" => BackgroundType::RepeatingLinearGradient,
-        "radial-gradient" => BackgroundType::RadialGradient,
-        "repeating-radial-gradient" => BackgroundType::RepeatingRadialGradient,
-        "image" => BackgroundType::Image,
-        _ => unreachable!(),
-    };
-
-    parse_gradient(brace_contents, background_type)
+            parse_gradient(brace_contents, background_type)
+        },
+        Err(_) => {
+            Ok(StyleBackground::Color(parse_css_color(input)?))
+        }
+    }
 }
 
 /// Given a string, returns how many characters need to be skipped
@@ -1293,12 +1397,13 @@ pub fn parse_gradient<'a>(input: &'a str, background_type: BackgroundType)
 {
     let input = input.trim();
 
-    if background_type == BackgroundType::Image {
-        let image = parse_image(input)?;
-        return Ok(image.into());
+    match background_type {
+        BackgroundType::Image => { return Ok(StyleBackground::Image(parse_image(input)?)); }
+        BackgroundType::Color => { return Ok(StyleBackground::Color(parse_css_color(input)?)); }
+        _ => { },
     }
 
-    // Splittin the input by "," doesn't work since rgba() might contain commas
+    // Splitting the input by "," doesn't work since rgba() might contain commas
     let mut comma_separated_items = Vec::<&str>::new();
     let mut current_input = &input[..];
 
@@ -1408,7 +1513,7 @@ pub fn parse_gradient<'a>(input: &'a str, background_type: BackgroundType)
                 stops: color_stops,
             }))
         },
-        BackgroundType::Image => unreachable!(),
+        BackgroundType::Image | BackgroundType::Color => unreachable!(),
     }
 }
 
@@ -1476,8 +1581,9 @@ impl<'a> From<QuoteStripped<'a>> for CssImageId {
     }
 }
 
+/// A string that has been stripped of the beginning and ending quote
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub struct QuoteStripped<'a>(pub(crate) &'a str);
+pub struct QuoteStripped<'a>(pub &'a str);
 
 pub fn parse_image<'a>(input: &'a str) -> Result<CssImageId, CssImageParseError<'a>> {
     Ok(strip_quotes(input)?.into())
@@ -1485,11 +1591,15 @@ pub fn parse_image<'a>(input: &'a str) -> Result<CssImageId, CssImageParseError<
 
 /// Strip quotes from an input, given that both quotes use either `"` or `'`, but not both.
 ///
-/// Example:
+/// # Example
 ///
-/// `"Helvetica"` - valid
-/// `'Helvetica'` - valid
-/// `'Helvetica"` - invalid
+/// ```rust
+/// # extern crate azul_css_parser;
+/// # use azul_css_parser::{strip_quotes, QuoteStripped, UnclosedQuotesError};
+/// assert_eq!(strip_quotes("\"Helvetica\""), Ok(QuoteStripped("Helvetica")));
+/// assert_eq!(strip_quotes("'Arial'"), Ok(QuoteStripped("Arial")));
+/// assert_eq!(strip_quotes("\"Arial'"), Err(UnclosedQuotesError("\"Arial'")));
+/// ```
 pub fn strip_quotes<'a>(input: &'a str) -> Result<QuoteStripped<'a>, UnclosedQuotesError<'a>> {
     let mut double_quote_iter = input.splitn(2, '"');
     double_quote_iter.next();
@@ -1506,25 +1616,26 @@ pub fn strip_quotes<'a>(input: &'a str) -> Result<QuoteStripped<'a>, UnclosedQuo
         if !quote_contents.ends_with('"') {
             return Err(UnclosedQuotesError(quote_contents));
         }
-        Ok(QuoteStripped(quote_contents.trim_right_matches("\"")))
+        Ok(QuoteStripped(quote_contents.trim_end_matches("\"")))
     } else if first_single_quote.is_some() {
         let quote_contents = first_single_quote.unwrap();
         if!quote_contents.ends_with('\'') {
             return Err(UnclosedQuotesError(input));
         }
-        Ok(QuoteStripped(quote_contents.trim_right_matches("'")))
+        Ok(QuoteStripped(quote_contents.trim_end_matches("'")))
     } else {
         Err(UnclosedQuotesError(input))
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum CssGradientStopParseError<'a> {
     Error(&'a str),
     Percentage(PercentageParseError),
     ColorParseError(CssColorParseError<'a>),
 }
 
+impl_debug_as_display!(CssGradientStopParseError<'a>);
 impl_display!{ CssGradientStopParseError<'a>, {
     Error(e) => e,
     Percentage(e) => format!("Failed to parse offset percentage: {}", e),
@@ -1542,25 +1653,24 @@ pub fn parse_gradient_stop<'a>(input: &'a str)
 
     let input = input.trim();
 
-    // If we'd split by whitespace left-to-right, then an input such as "rgba(0, 0, 0, 0) 40%, "
-    // wouldn't parse, since it would split at the first whitespace, independent of the parentheses,
-    // i.e. "rgba(0,". To fix that, we simply parse left-to-right.
-    let (color_str, percentage_str) = match input.rfind(char::is_whitespace) {
-        Some(last_whitespace) => {
-            if input[..last_whitespace].find('(').is_some() {
-                if input[..last_whitespace].find(')').is_some() {
-                    // rgba() with whitespace
-                    (&input[..last_whitespace], Some(&input[(last_whitespace + 1)..]))
-                } else {
-                    // rgba(), no percentage
-                    (&input[..last_whitespace], None)
-                }
-            } else {
-                // #abc + percentage_value
-                (&input[..last_whitespace], None)
-            }
+    // Color functions such as "rgba(...)" can contain spaces, so we parse right-to-left.
+    let (color_str, percentage_str) = match (input.rfind(')'), input.rfind(char::is_whitespace)) {
+        (Some(closing_brace), None) if closing_brace < input.len() - 1 => {
+            // percentage after closing brace, eg. "rgb(...)50%"
+            (&input[..=closing_brace], Some(&input[(closing_brace + 1)..]))
         },
-        None => (input, None) // #abc, no percentage value
+        (None, Some(last_ws)) => {
+            // percentage after last whitespace, eg. "... 50%"
+            (&input[..=last_ws], Some(&input[(last_ws + 1)..]))
+        }
+        (Some(closing_brace), Some(last_ws)) if closing_brace < last_ws => {
+            // percentage after last whitespace, eg. "... 50%"
+            (&input[..=last_ws], Some(&input[(last_ws + 1)..]))
+        },
+        _ => {
+            // no percentage
+            (input, None)
+        },
     };
 
     let color = parse_css_color(color_str)?;
@@ -1608,7 +1718,21 @@ impl<'a> From<CssDirectionCornerParseError<'a>> for CssDirectionParseError<'a> {
     }
 }
 
-// parses "50deg", "to right bottom"
+/// Parses an `direction` such as `"50deg"` or `"to right bottom"` (in the context of gradients)
+///
+/// # Example
+///
+/// ```rust
+/// # extern crate azul_css;
+/// # extern crate azul_css_parser;
+/// # use azul_css_parser::parse_direction;
+/// # use azul_css::{Direction, FloatValue};
+/// use azul_css::DirectionCorner::*;
+///
+/// assert_eq!(parse_direction("to right bottom"), Ok(Direction::FromTo(TopLeft, BottomRight)));
+/// assert_eq!(parse_direction("to right"), Ok(Direction::FromTo(Left, Right)));
+/// assert_eq!(parse_direction("50deg"), Ok(Direction::Angle(FloatValue::new(50.0))));
+/// ```
 pub fn parse_direction<'a>(input: &'a str)
 -> Result<Direction, CssDirectionParseError<'a>>
 {
@@ -1707,8 +1831,6 @@ impl_display!{CssShapeParseError<'a>, {
 /// (todo: border-box?)
 #[derive(Default, Debug, Clone, PartialEq, Hash)]
 pub struct RectStyle {
-    /// Background color of this rectangle
-    pub background_color: Option<StyleBackgroundColor>,
     /// Background size of this rectangle
     pub background_size: Option<StyleBackgroundSize>,
     /// Background repeat of this rectangle
@@ -1738,6 +1860,7 @@ pub struct RectStyle {
 }
 
 typed_pixel_value_parser!(parse_style_letter_spacing, StyleLetterSpacing);
+typed_pixel_value_parser!(parse_style_word_spacing, StyleWordSpacing);
 
 // Layout constraints for a given rectangle, such as "width", "min-width", "height", etc.
 #[derive(Default, Debug, Copy, Clone, PartialEq, Hash)]
@@ -1813,6 +1936,12 @@ pub fn parse_layout_flex_shrink<'a>(input: &'a str) -> Result<LayoutFlexShrink, 
     }
 }
 
+pub fn parse_style_tab_width(input: &str)
+-> Result<StyleTabWidth, PercentageParseError>
+{
+    parse_percentage_value(input).and_then(|e| Ok(StyleTabWidth(e)))
+}
+
 pub fn parse_style_line_height(input: &str)
 -> Result<StyleLineHeight, PercentageParseError>
 {
@@ -1838,29 +1967,34 @@ impl<'a> From<UnclosedQuotesError<'a>> for CssStyleFontFamilyParseError<'a> {
     }
 }
 
-// parses a "font-family" declaration, such as:
-//
-// "Webly Sleeky UI", monospace
-// 'Webly Sleeky Ui', monospace
-// sans-serif
+/// Parses a `StyleFontFamily` declaration from a `&str`
+///
+/// # Example
+///
+/// ```rust
+/// # extern crate azul_css;
+/// # extern crate azul_css_parser;
+/// # use azul_css_parser::parse_style_font_family;
+/// # use azul_css::{StyleFontFamily, FontId};
+/// let input = "\"Helvetica\", 'Arial', Times New Roman";
+/// let fonts = vec![
+///     FontId("Helvetica".into()),
+///     FontId("Arial".into()),
+///     FontId("Times New Roman".into())
+/// ];
+///
+/// assert_eq!(parse_style_font_family(input), Ok(StyleFontFamily { fonts }));
+/// ```
 pub fn parse_style_font_family<'a>(input: &'a str) -> Result<StyleFontFamily, CssStyleFontFamilyParseError<'a>> {
     let multiple_fonts = input.split(',');
     let mut fonts = Vec::with_capacity(1);
 
     for font in multiple_fonts {
         let font = font.trim();
-
-        let mut double_quote_iter = font.splitn(2, '"');
-        double_quote_iter.next();
-        let mut single_quote_iter = font.splitn(2, '\'');
-        single_quote_iter.next();
-
-        if double_quote_iter.next().is_some() || single_quote_iter.next().is_some() {
-            let stripped_font = strip_quotes(font)?;
-            fonts.push(FontId::ExternalFont(stripped_font.0.into()));
-        } else {
-            fonts.push(FontId::BuiltinFont(font.into()));
-        }
+        let font = font.trim_matches('\'');
+        let font = font.trim_matches('\"');
+        let font = font.trim();
+        fonts.push(FontId(font.into()));
     }
 
     Ok(StyleFontFamily {
@@ -2012,7 +2146,7 @@ multi_type_parser!(parse_layout_position, LayoutPosition,
                     ["absolute", Absolute],
                     ["relative", Relative]);
 
-multi_type_parser!(parse_layout_text_overflow, TextOverflowBehaviourInner,
+multi_type_parser!(parse_layout_text_overflow, Overflow,
                     ["auto", Auto],
                     ["scroll", Scroll],
                     ["visible", Visible],
@@ -2156,6 +2290,18 @@ mod css_tests {
     }
 
     #[test]
+    fn test_parse_css_border_3() {
+        assert_eq!(
+            parse_css_border("1px solid rgb(51, 153, 255)"),
+            Ok(StyleBorderSide {
+                border_width: PixelValue::px(1.0),
+                border_style: BorderStyle::Solid,
+                border_color: ColorU { r: 51, g: 153, b: 255, a: 255 },
+            })
+        );
+    }
+
+    #[test]
     fn test_parse_linear_gradient_1() {
         assert_eq!(parse_style_background("linear-gradient(red, yellow)"),
             Ok(StyleBackground::LinearGradient(LinearGradient {
@@ -2289,11 +2435,26 @@ mod css_tests {
         ));
     }
 
-/*  These tests currently fail because linear-gradient splits on commas, which are included in some
- *  kinds of css color specifiers.
-
     #[test]
     fn test_parse_linear_gradient_8() {
+        assert_eq!(parse_style_background("linear-gradient(to bottom, rgb(255,0, 0),rgb(0,0,0))"),
+            Ok(StyleBackground::LinearGradient(LinearGradient {
+                direction: Direction::FromTo(DirectionCorner::Top, DirectionCorner::Bottom),
+                extend_mode: ExtendMode::Clamp,
+                stops: vec![GradientStopPre {
+                    offset: Some(PercentageValue::new(0.0)),
+                    color: ColorU { r: 255, g: 0, b: 0, a: 255 },
+                },
+                GradientStopPre {
+                    offset: Some(PercentageValue::new(100.0)),
+                    color: ColorU { r: 0, g: 0, b: 0, a: 255 },
+                }],
+            })
+        ));
+    }
+
+    #[test]
+    fn test_parse_linear_gradient_9() {
         assert_eq!(parse_style_background("linear-gradient(10deg, rgb(10, 30, 20), yellow)"),
             Ok(StyleBackground::LinearGradient(LinearGradient {
                 direction: Direction::Angle(FloatValue::new(10.0)),
@@ -2310,10 +2471,10 @@ mod css_tests {
     }
 
     #[test]
-    fn test_parse_linear_gradient_8() {
-        assert_eq!(parse_style_background("linear-gradient(50deg, rgb(10, 30, 20, 0.93), hsla(40deg, 80%, 30%, 0.1))"),
+    fn test_parse_linear_gradient_10() {
+        assert_eq!(parse_style_background("linear-gradient(50deg, rgba(10, 30, 20, 0.93), hsla(40deg, 80%, 30%, 0.1))"),
             Ok(StyleBackground::LinearGradient(LinearGradient {
-                direction: Direction::Angle(FloatValue::new(40.0)),
+                direction: Direction::Angle(FloatValue::new(50.0)),
                 extend_mode: ExtendMode::Clamp,
                 stops: vec![GradientStopPre {
                     offset: Some(PercentageValue::new(0.0)),
@@ -2325,7 +2486,29 @@ mod css_tests {
                 }],
         })));
     }
-*/
+
+    #[test]
+    fn test_parse_linear_gradient_11() {
+        // wacky whitespace on purpose
+        assert_eq!(parse_style_background("linear-gradient(to bottom,rgb(255,0, 0)0%, rgb( 0 , 255 , 0 ) 10% ,blue   100%  )"),
+            Ok(StyleBackground::LinearGradient(LinearGradient {
+                direction: Direction::FromTo(DirectionCorner::Top, DirectionCorner::Bottom),
+                extend_mode: ExtendMode::Clamp,
+                stops: vec![GradientStopPre {
+                    offset: Some(PercentageValue::new(0.0)),
+                    color: ColorU { r: 255, g: 0, b: 0, a: 255 },
+                },
+                GradientStopPre {
+                    offset: Some(PercentageValue::new(10.0)),
+                    color: ColorU { r: 0, g: 255, b: 0, a: 255 },
+                },
+                GradientStopPre {
+                    offset: Some(PercentageValue::new(100.0)),
+                    color: ColorU { r: 0, g: 0, b: 255, a: 255 },
+                }],
+            })
+        ));
+    }
 
     #[test]
     fn test_parse_radial_gradient_1() {
@@ -2538,32 +2721,37 @@ mod css_tests {
 
     #[test]
     fn test_parse_css_color_30() {
-        assert_eq!(parse_css_color("hsla(240deg, 0%, 0%, )"), Err(CssColorParseError::MissingColorComponent(CssColorComponent::Alpha)))
+        assert_eq!(parse_css_color("hsla(240deg, 0%, 0%, )"), Err(CssColorParseError::MissingColorComponent(CssColorComponent::Alpha)));
     }
 
     #[test]
     fn test_parse_css_color_31() {
-        assert_eq!(parse_css_color("hsl(, 0%, 0%, )"), Err(CssColorParseError::MissingColorComponent(CssColorComponent::Hue)))
+        assert_eq!(parse_css_color("hsl(, 0%, 0%, )"), Err(CssColorParseError::MissingColorComponent(CssColorComponent::Hue)));
     }
 
     #[test]
     fn test_parse_css_color_32() {
-        assert_eq!(parse_css_color("hsl(240deg ,  )"), Err(CssColorParseError::MissingColorComponent(CssColorComponent::Saturation)))
+        assert_eq!(parse_css_color("hsl(240deg ,  )"), Err(CssColorParseError::MissingColorComponent(CssColorComponent::Saturation)));
     }
 
     #[test]
     fn test_parse_css_color_33() {
-        assert_eq!(parse_css_color("hsl(240deg, 0%,  )"), Err(CssColorParseError::MissingColorComponent(CssColorComponent::Lightness)))
+        assert_eq!(parse_css_color("hsl(240deg, 0%,  )"), Err(CssColorParseError::MissingColorComponent(CssColorComponent::Lightness)));
     }
 
     #[test]
     fn test_parse_css_color_34() {
-        assert_eq!(parse_css_color("hsl(240deg, 0%, 0%,  )"), Err(CssColorParseError::ExtraArguments("")))
+        assert_eq!(parse_css_color("hsl(240deg, 0%, 0%,  )"), Err(CssColorParseError::ExtraArguments("")));
     }
 
     #[test]
     fn test_parse_css_color_35() {
-        assert_eq!(parse_css_color("hsla(240deg, 0%, 0%  )"), Err(CssColorParseError::MissingColorComponent(CssColorComponent::Alpha)))
+        assert_eq!(parse_css_color("hsla(240deg, 0%, 0%  )"), Err(CssColorParseError::MissingColorComponent(CssColorComponent::Alpha)));
+    }
+
+    #[test]
+    fn test_parse_css_color_36() {
+        assert_eq!(parse_css_color("rgb(255,0, 0)"), Ok(ColorU { r: 255, g: 0, b: 0, a: 255 }));
     }
 
     #[test]
@@ -2583,7 +2771,7 @@ mod css_tests {
 
     #[test]
     fn test_parse_pixel_value_4() {
-        assert_eq!(parse_pixel_value("aslkfdjasdflk"), Err(PixelParseError::InvalidComponent("aslkfdjasdflk")));
+        assert_eq!(parse_pixel_value("aslkfdjasdflk"), Err(PixelParseError::NoValueGiven("aslkfdjasdflk")));
     }
 
     #[test]
@@ -2627,8 +2815,8 @@ mod css_tests {
     fn test_parse_style_font_family_1() {
         assert_eq!(parse_style_font_family("\"Webly Sleeky UI\", monospace"), Ok(StyleFontFamily {
             fonts: vec![
-                FontId::ExternalFont("Webly Sleeky UI".into()),
-                FontId::BuiltinFont("monospace".into()),
+                FontId("Webly Sleeky UI".into()),
+                FontId("monospace".into()),
             ]
         }));
     }
@@ -2637,7 +2825,7 @@ mod css_tests {
     fn test_parse_style_font_family_2() {
         assert_eq!(parse_style_font_family("'Webly Sleeky UI'"), Ok(StyleFontFamily {
             fonts: vec![
-                FontId::ExternalFont("Webly Sleeky UI".into()),
+                FontId("Webly Sleeky UI".into()),
             ]
         }));
     }

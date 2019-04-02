@@ -31,7 +31,7 @@ fn render_my_texture(
 }
 
 fn main() {
-    let app = App::new(OpenGlAppState { }, AppConfig::default());
-    let window = Window::new(WindowCreateOptions::default(), css::native()).unwrap();
+    let mut app = App::new(OpenGlAppState { }, AppConfig::default()).unwrap();
+    let window = app.create_window(WindowCreateOptions::default(), css::native()).unwrap();
     app.run(window).unwrap();
 }

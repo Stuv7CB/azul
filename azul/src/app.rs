@@ -1,59 +1,177 @@
 use std::{
     mem,
     fmt,
-    rc::Rc,
     collections::BTreeMap,
     sync::{Arc, Mutex, PoisonError},
 };
 #[cfg(debug_assertions)]
 use std::time::Instant;
+#[cfg(debug_assertions)]
+use azul_css::HotReloadHandler;
 use glium::{
     SwapBuffersError,
     glutin::{
-        Event,
+        WindowEvent, WindowId as GliumWindowId,
         dpi::{LogicalPosition, LogicalSize}
     },
 };
+use gleam::gl::{self, Gl, GLuint};
 use webrender::{
-    PipelineInfo,
+    PipelineInfo, Renderer,
     api::{
         HitTestResult, HitTestFlags, DevicePixel,
         WorldPoint, LayoutSize, LayoutPoint,
-        Epoch, Transaction, ImageFormat as RawImageFormat,
+        Epoch, Transaction,
     },
 };
-use rusttype::Font;
 #[cfg(feature = "image_loading")]
-use image::ImageError;
+use app_resources::ImageSource;
 #[cfg(feature = "logging")]
 use log::LevelFilter;
-use azul_css::{FontId, PixelValue, StyleLetterSpacing};
+use azul_css::{Css, ColorU};
 use {
-    error::{FontError, ClipboardError},
-    window::{Window, WindowId, FakeWindow, ScrollStates},
-    window_state::WindowSize,
-    text_cache::TextId,
-    dom::{ScrollTagId, UpdateScreen},
-    app_resources::AppResources,
-    app_state::AppState,
+    FastHashMap,
+    error::ClipboardError,
+    window::{
+        Window, FakeWindow, ScrollStates,
+        WindowCreateError, WindowCreateOptions, RendererType,
+    },
+    window_state::{WindowSize, DebugState},
+    app_resources::TextId,
+    dom::ScrollTagId,
+    app_resources::{
+        ImageId, FontSource, FontId, ImageReloadError,
+        FontReloadError, CssImageId, RawImage,
+    },
     traits::Layout,
     ui_state::UiState,
     ui_description::UiDescription,
-    daemon::{Daemon, DaemonId},
-    images::ImageId,
-    focus::FocusTarget,
-    task::Task,
+    async::{Task, Timer, TimerId, TerminateTimer},
+    callbacks::{FocusTarget, UpdateScreen, Redraw, DontRedraw},
 };
+pub use app_resources::AppResources;
 
 type DeviceUintSize = ::euclid::TypedSize2D<u32, DevicePixel>;
 type DeviceIntSize = ::euclid::TypedSize2D<i32, DevicePixel>;
 
+// Default clear color is white, to signify that there is rendering going on
+// (otherwise, "transparent") backgrounds would be painted black.
+const COLOR_WHITE: ColorU = ColorU { r: 255, g: 255, b: 255, a: 0 };
+
 /// Graphical application that maintains some kind of application state
 pub struct App<T: Layout> {
-    /// The graphical windows, indexed by ID
-    windows: BTreeMap<WindowId, Window<T>>,
+    /// The graphical windows, indexed by their system ID / handle
+    windows: BTreeMap<GliumWindowId, Window<T>>,
     /// The global application state
     pub app_state: AppState<T>,
+    /// Application configuration, whether to enable logging, etc.
+    pub config: AppConfig,
+}
+
+/// Configuration for optional features, such as whether to enable logging or panic hooks
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "logging"), derive(Copy))]
+pub struct AppConfig {
+    /// If enabled, logs error and info messages.
+    ///
+    /// Default is `Some(LevelFilter::Error)` to log all errors by default
+    #[cfg(feature = "logging")]
+    pub enable_logging: Option<LevelFilter>,
+    /// Path to the output log if the logger is enabled
+    #[cfg(feature = "logging")]
+    pub log_file_path: Option<String>,
+    /// If the app crashes / panics, a window with a message box pops up.
+    /// Setting this to `false` disables the popup box.
+    #[cfg(feature = "logging")]
+    pub enable_visual_panic_hook: bool,
+    /// If this is set to `true` (the default), a backtrace + error information
+    /// gets logged to stdout and the logging file (only if logging is enabled).
+    #[cfg(feature = "logging")]
+    pub enable_logging_on_panic: bool,
+    /// (STUB) Whether keyboard navigation should be enabled (default: true).
+    /// Currently not implemented.
+    pub enable_tab_navigation: bool,
+    /// Whether to force a hardware or software renderer
+    pub renderer_type: RendererType,
+    /// Debug state for all windows
+    pub debug_state: DebugState,
+    /// Background color for all windows
+    pub background_color: ColorU,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            #[cfg(feature = "logging")]
+            enable_logging: Some(LevelFilter::Error),
+            #[cfg(feature = "logging")]
+            log_file_path: None,
+            #[cfg(feature = "logging")]
+            enable_visual_panic_hook: true,
+            #[cfg(feature = "logging")]
+            enable_logging_on_panic: true,
+            enable_tab_navigation: true,
+            renderer_type: RendererType::default(),
+            debug_state: DebugState::default(),
+            background_color: COLOR_WHITE,
+        }
+    }
+}
+
+/// Wrapper for your application data, stores the data, windows and resources, as
+/// well as running timers and asynchronous tasks.
+///
+/// In order to be layout-able, your data model needs to satisfy the `Layout` trait,
+/// which maps the state of your application to a DOM (how the application data should be laid out)
+pub struct AppState<T: Layout> {
+    /// Your data (the global struct which all callbacks will have access to)
+    pub data: Arc<Mutex<T>>,
+    /// This field represents the state of the windows, public to the user. You can
+    /// mess around with the state as you like, however, the actual window won't update
+    /// until the next frame. This is done to "decouple" the frameworks internal
+    /// state updating logic from the user code (and to make the API future-proof
+    /// in case extra functions are introduced).
+    ///
+    /// Another reason this is needed is to (later) introduce testing for the window
+    /// state - if the API would directly modify the window itself, these changes
+    /// wouldn't be recorded anywhere, so there wouldn't be a way to unit-test certain APIs.
+    ///
+    /// The state of these `FakeWindow`s gets deleted and recreated on each frame, especially
+    /// the app's style. This should force a user to design his code in a functional way,
+    /// without relying on state-based conditions. Example:
+    ///
+    /// ```no_run,ignore
+    /// let window_state = &mut app_state.windows[event.window];
+    /// // Update the title
+    /// window_state.state.title = "Hello";
+    /// ```
+    pub windows: BTreeMap<GliumWindowId, FakeWindow<T>>,
+    /// Fonts, images and cached text that is currently loaded inside the app (window-independent).
+    ///
+    /// Accessing this field is often required to load new fonts or images, so instead of
+    /// requiring the `FontHashMap`, a lot of functions just require the whole `AppResources` field.
+    pub resources: AppResources,
+    /// Currently running timers (polling functions, run on the main thread)
+    pub(crate) timers: FastHashMap<TimerId, Timer<T>>,
+    /// Currently running tasks (asynchronous functions running each on a different thread)
+    pub(crate) tasks: Vec<Task<T>>,
+}
+
+/// Same as the [AppState](./struct.AppState.html) but without the
+/// `self.data` field - used for default callbacks, so that callbacks can
+/// load and unload fonts or images + access the system clipboard
+///
+/// Default callbacks don't have access to the `AppState.data` field,
+/// since they use a `StackCheckedPointer` instead.
+pub struct AppStateNoData<'a, T: 'a + Layout> {
+    /// See [`AppState.windows`](./struct.AppState.html#structfield.windows)
+    pub windows: &'a BTreeMap<GliumWindowId, FakeWindow<T>>,
+    /// See [`AppState.resources`](./struct.AppState.html#structfield.resources)
+    pub resources : &'a mut AppResources,
+    /// Currently running timers (polling functions, run on the main thread)
+    pub(crate) timers: FastHashMap<TimerId, Timer<T>>,
+    /// Currently running tasks (asynchronous functions running each on a different thread)
+    pub(crate) tasks: Vec<Task<T>>,
 }
 
 /// Error returned by the `.run()` function
@@ -67,6 +185,30 @@ pub enum RuntimeError<T: Layout> {
     MutexPoisonError(PoisonError<T>),
     MutexLockError,
     WindowIndexError,
+}
+
+pub(crate) struct FrameEventInfo {
+    pub(crate) should_redraw_window: bool,
+    pub(crate) should_swap_window: bool,
+    pub(crate) should_hittest: bool,
+    pub(crate) cur_cursor_pos: LogicalPosition,
+    pub(crate) new_window_size: Option<LogicalSize>,
+    pub(crate) new_dpi_factor: Option<f64>,
+    pub(crate) is_resize_event: bool,
+}
+
+impl Default for FrameEventInfo {
+    fn default() -> Self {
+        Self {
+            should_redraw_window: false,
+            should_swap_window: false,
+            should_hittest: false,
+            cur_cursor_pos: LogicalPosition::new(0.0, 0.0),
+            new_window_size: None,
+            new_dpi_factor: None,
+            is_resize_event: false,
+        }
+    }
 }
 
 impl<T: Layout> From<PoisonError<T>> for RuntimeError<T> {
@@ -100,79 +242,19 @@ impl<T: Layout> fmt::Display for RuntimeError<T> {
     }
 }
 
-pub(crate) struct FrameEventInfo {
-    pub(crate) should_redraw_window: bool,
-    pub(crate) should_swap_window: bool,
-    pub(crate) should_hittest: bool,
-    pub(crate) cur_cursor_pos: LogicalPosition,
-    pub(crate) new_window_size: Option<LogicalSize>,
-    pub(crate) new_dpi_factor: Option<f64>,
-    pub(crate) is_resize_event: bool,
-}
-
-impl Default for FrameEventInfo {
-    fn default() -> Self {
-        Self {
-            should_redraw_window: false,
-            should_swap_window: false,
-            should_hittest: false,
-            cur_cursor_pos: LogicalPosition::new(0.0, 0.0),
-            new_window_size: None,
-            new_dpi_factor: None,
-            is_resize_event: false,
-        }
-    }
-}
-
-/// Configuration for optional features, such as whether to enable logging or panic hooks
-#[derive(Debug, Clone)]
-#[cfg_attr(not(feature = "logging"), derive(Copy))]
-pub struct AppConfig {
-    /// If enabled, logs error and info messages.
-    ///
-    /// Default is `Some(LevelFilter::Error)` to log all errors by default
-    #[cfg(feature = "logging")]
-    pub enable_logging: Option<LevelFilter>,
-    /// Path to the output log if the logger is enabled
-    #[cfg(feature = "logging")]
-    pub log_file_path: Option<String>,
-    /// If the app crashes / panics, a window with a message box pops up.
-    /// Setting this to `false` disables the popup box.
-    #[cfg(feature = "logging")]
-    pub enable_visual_panic_hook: bool,
-    /// If this is set to `true` (the default), a backtrace + error information
-    /// gets logged to stdout and the logging file (only if logging is enabled).
-    #[cfg(feature = "logging")]
-    pub enable_logging_on_panic: bool,
-    /// (STUB) Whether keyboard navigation should be enabled (default: true).
-    /// Currently not implemented.
-    pub enable_tab_navigation: bool,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            #[cfg(feature = "logging")]
-            enable_logging: Some(LevelFilter::Error),
-            #[cfg(feature = "logging")]
-            log_file_path: None,
-            #[cfg(feature = "logging")]
-            enable_visual_panic_hook: true,
-            #[cfg(feature = "logging")]
-            enable_logging_on_panic: true,
-            enable_tab_navigation: true,
-        }
-    }
+impl<'a, T: 'a + Layout> AppStateNoData<'a, T> {
+    impl_deamon_api!();
 }
 
 impl<T: Layout> App<T> {
 
     #[allow(unused_variables)]
     /// Create a new, empty application. This does not open any windows.
-    pub fn new(initial_data: T, config: AppConfig) -> Self {
+    pub fn new(initial_data: T, config: AppConfig) -> Result<Self, WindowCreateError> {
+
         #[cfg(feature = "logging")] {
             if let Some(log_level) = config.enable_logging {
-                ::logging::set_up_logging(config.log_file_path, log_level);
+                ::logging::set_up_logging(config.log_file_path.as_ref().map(|s| s.as_str()), log_level);
 
                 if config.enable_logging_on_panic {
                     ::logging::set_up_panic_hooks();
@@ -185,17 +267,52 @@ impl<T: Layout> App<T> {
             }
         }
 
-        Self {
-            windows: BTreeMap::new(),
-            app_state: AppState::new(initial_data),
+        let mut app_state = AppState::new(initial_data, &config)?;
+
+        if let Some(r) = &mut app_state.resources.fake_display.renderer {
+            set_webrender_debug_flags(r, &DebugState::default(), &config.debug_state);
         }
+
+        Ok(Self {
+            windows: BTreeMap::new(),
+            app_state,
+            config,
+        })
+    }
+
+    /// Creates a new window
+    pub fn create_window(&mut self, options: WindowCreateOptions<T>, css: Css)
+    -> Result<Window<T>, WindowCreateError>
+    {
+        Window::new(
+            &mut self.app_state.resources.fake_display.render_api,
+            &mut self.app_state.resources.fake_display.hidden_display.gl_window().context(),
+            &mut self.app_state.resources.fake_display.hidden_events_loop,
+            options,
+            css,
+            self.config.background_color,
+        )
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn create_hot_reload_window(&mut self, options: WindowCreateOptions<T>, css_loader: Box<dyn HotReloadHandler>)
+    -> Result<Window<T>, WindowCreateError>
+    {
+        Window::new_hot_reload(
+            &mut self.app_state.resources.fake_display.render_api,
+            &mut self.app_state.resources.fake_display.hidden_display.gl_window().context(),
+            &mut self.app_state.resources.fake_display.hidden_events_loop,
+            options,
+            css_loader,
+            self.config.background_color,
+        )
     }
 
     /// Spawn a new window on the screen. Note that this should only be used to
     /// create extra windows, the default window will be the window submitted to
     /// the `.run` method.
-    pub fn push_window(&mut self, window: Window<T>) {
-        use default_callbacks::DefaultCallbackSystem;
+    pub fn add_window(&mut self, window: Window<T>) {
+        use callbacks::DefaultCallbackSystem;
 
         let window_id = window.id;
         let fake_window = FakeWindow {
@@ -230,10 +347,10 @@ impl<T: Layout> App<T> {
     /// // continue the rest of the program here...
     /// println!("username: {:?}, password: {:?}", username, password);
     /// ```
-    pub fn run(mut self, window: Window<T>) -> Result<T, RuntimeError<T>>
-    {
+    pub fn run(mut self, window: Window<T>) -> Result<T, RuntimeError<T>> {
+
         // Apps need to have at least one window open
-        self.push_window(window);
+        self.add_window(window);
         self.run_inner()?;
 
         // NOTE: This is necessary because otherwise, the Arc::try_unwrap would fail,
@@ -248,8 +365,8 @@ impl<T: Layout> App<T> {
 
     fn run_inner(&mut self) -> Result<(), RuntimeError<T>> {
 
-        use std::{thread, time::{Duration, Instant}};
-        use dom::Redraw;
+        use std::{thread, time::Duration};
+        use glium::glutin::Event;
         use self::RuntimeError::*;
 
         let mut ui_state_cache = {
@@ -272,31 +389,62 @@ impl<T: Layout> App<T> {
         while !self.windows.is_empty() {
 
             let time_start = Instant::now();
-            let mut closed_windows = Vec::<WindowId>::new();
+            let mut closed_windows = Vec::<GliumWindowId>::new();
             let mut frame_was_resize = false;
+            let mut events = Vec::new();
 
-            'window_loop: for (window_id, mut window) in self.windows.iter_mut() {
+            self.app_state.resources.fake_display.hidden_events_loop.poll_events(|e| match e {
+                // Filter out all events that are uninteresting or unnecessary
+                Event::WindowEvent { event: WindowEvent::Refresh, .. } => { },
+                _ => { events.push(e); },
+            });
+
+            // let current_desktop_events = get_desktop_events(window, &events);
+
+            for (current_window_id, mut window) in self.windows.iter_mut() {
+
+                // Only process the events belong to this window ID...
+                let window_events = events.iter().cloned().filter_map(|e| match e {
+                    Event::WindowEvent { window_id, event } => {
+                        if *current_window_id == window_id { Some(event) } else { None }
+                    },
+                    _ => None
+                }).collect::<Vec<WindowEvent>>();
+
                 let (event_was_resize, window_was_closed) =
-                render_single_window_content(
-                    &mut window,
-                    &window_id,
-                    &mut self.app_state,
-                    &mut ui_state_cache,
-                    &mut ui_description_cache,
-                    &mut force_redraw_cache,
-                    &mut awakened_task,
-                )?;
+                    render_single_window_content(
+                        &self.config,
+                        &window_events,
+                        &current_window_id,
+                        &mut window,
+                        &mut self.app_state,
+                        &mut ui_state_cache,
+                        &mut ui_description_cache,
+                        &mut force_redraw_cache,
+                        &mut awakened_task,
+                    )?;
 
                 if event_was_resize {
                     frame_was_resize = true;
                 }
+
                 if window_was_closed {
-                    closed_windows.push(*window_id);
+                    closed_windows.push(*current_window_id);
+
+                    // TODO: Currently there is no way to return from the main event loop
+                    // i.e. the windows aren't actually getting closed
+                    // This is a hack, so that windows currently close properly
+                    return Ok(());
                 }
             }
 
             #[cfg(debug_assertions)] {
-                hot_reload_css(&mut self.windows, &mut last_style_reload, &mut should_print_css_error, &mut awakened_task)?;
+                hot_reload_css(
+                    &mut self.windows,
+                    &mut last_style_reload,
+                    &mut should_print_css_error,
+                    &mut awakened_task
+                )?;
             }
 
             // Close windows if necessary
@@ -307,19 +455,23 @@ impl<T: Layout> App<T> {
                 self.windows.remove(&closed_window_id);
             });
 
-            let should_redraw_daemons = self.app_state.run_all_daemons();
+            let should_redraw_timers = self.app_state.run_all_timers();
             let should_redraw_tasks = self.app_state.clean_up_finished_tasks();
-            let should_redraw_daemons_or_tasks = [should_redraw_daemons, should_redraw_tasks].into_iter().any(|e| *e == Redraw);
+            let should_redraw_timers_or_tasks = [should_redraw_timers, should_redraw_tasks].into_iter().any(|e| *e == Redraw);
 
-            if should_redraw_daemons_or_tasks {
-                self.windows.iter().for_each(|(_, window)| window.events_loop.create_proxy().wakeup().unwrap_or(()));
-                awakened_task = self.windows.keys().map(|window_id| {
-                    (*window_id, true)
-                }).collect();
+            if should_redraw_timers_or_tasks {
+                // self.windows.iter().for_each(|(_, window)| {
+                //     app_state.resources.fake_display.events_loop.create_proxy().wakeup().unwrap_or(())
+                // });
+                awakened_task = self.windows.keys().map(|window_id| (*window_id, true)).collect();
                 for window_id in self.windows.keys() {
                     *force_redraw_cache.get_mut(window_id).ok_or(WindowIndexError)? = 2;
                 }
             }
+
+            // Automatically remove unused fonts and images from webrender
+            // Tell the font + image GC to start a new frame
+            self.app_state.resources.garbage_collect_fonts_and_images();
 
             if !frame_was_resize {
                 // Wait until 16ms have passed, but not during a resize event
@@ -338,59 +490,135 @@ impl<T: Layout> App<T> {
     pub fn add_task(&mut self, task: Task<T>) {
         self.app_state.add_task(task);
     }
+
+    /// Toggles debugging flags in webrender, updates `self.config.debug_state`
+    pub fn toggle_debug_flags(&mut self, new_state: DebugState) {
+        if let Some(r) = &mut self.app_state.resources.fake_display.renderer {
+            set_webrender_debug_flags(r, &self.config.debug_state, &new_state);
+        }
+        self.config.debug_state = new_state;
+    }
 }
 
 image_api!(App::app_state);
 font_api!(App::app_state);
 text_api!(App::app_state);
 clipboard_api!(App::app_state);
-daemon_api!(App::app_state);
+timer_api!(App::app_state);
 
-/// Render the contents of one single window. Returns
-/// (if the event was a resize event, if the window was closed)
-fn render_single_window_content<T: Layout>(
-    window: &mut Window<T>,
-    window_id: &WindowId,
-    app_state: &mut AppState<T>,
-    ui_state_cache: &mut BTreeMap<WindowId, UiState<T>>,
-    ui_description_cache: &mut BTreeMap<WindowId, UiDescription<T>>,
-    force_redraw_cache: &mut BTreeMap<WindowId, usize>,
-    awakened_task: &mut BTreeMap<WindowId, bool>,
-) -> Result<(bool, bool), RuntimeError<T>>
-{
-    use dom::Redraw;
-    use self::RuntimeError::*;
-    use glium::glutin::WindowEvent;
+impl<T: Layout> AppState<T> {
 
-    let mut frame_was_resize = false;
-    let mut events = Vec::new();
-
-    window.events_loop.poll_events(|e| match e {
-        // Filter out all events that are uninteresting or unnecessary
-        Event::WindowEvent { event: WindowEvent::Refresh, .. } => { },
-        _ => { events.push(e); },
-    });
-
-    if events.is_empty() {
-        let window_should_close = false;
-        return Ok((frame_was_resize, window_should_close));
+    /// Creates a new `AppState`
+    fn new(initial_data: T, config: &AppConfig) -> Result<Self, WindowCreateError> {
+        Ok(Self {
+            data: Arc::new(Mutex::new(initial_data)),
+            windows: BTreeMap::new(),
+            resources: AppResources::new(config)?,
+            timers: FastHashMap::default(),
+            tasks: Vec::new(),
+        })
     }
 
-    let (mut frame_event_info, window_should_close) =
-        window.state.update_window_state(&events, awakened_task[window_id]);
+    impl_deamon_api!();
+
+    /// Run all currently registered timers
+    #[must_use]
+    fn run_all_timers(&mut self) -> UpdateScreen {
+        let mut should_update_screen = DontRedraw;
+        let mut lock = self.data.lock().unwrap();
+        let mut timers_to_terminate = Vec::new();
+
+        for (key, timer) in self.timers.iter_mut() {
+            let (should_update, should_terminate) = timer.invoke_callback_with_data(&mut lock, &mut self.resources);
+
+            if should_update == Redraw &&
+               should_update_screen == DontRedraw {
+                should_update_screen = Redraw;
+            }
+
+            if should_terminate == TerminateTimer::Terminate {
+                timers_to_terminate.push(key.clone());
+            }
+        }
+
+        for key in timers_to_terminate {
+            self.timers.remove(&key);
+        }
+
+        should_update_screen
+    }
+
+    /// Remove all tasks that have finished executing
+    #[must_use] fn clean_up_finished_tasks(&mut self) -> UpdateScreen {
+        let old_count = self.tasks.len();
+        let mut timers_to_add = Vec::new();
+        self.tasks.retain(|task| {
+            if task.is_finished() {
+                if let Some(timer) = task.after_completion_timer {
+                    timers_to_add.push((TimerId::new(), timer));
+                }
+                false
+            } else {
+                true
+            }
+        });
+
+        let timers_is_empty = timers_to_add.is_empty();
+        let new_count = self.tasks.len();
+
+        // Start all the timers that should run after the completion of the task
+        for (timer_id, timer) in timers_to_add {
+            self.add_timer(timer_id, timer);
+        }
+
+        if old_count == new_count && timers_is_empty {
+            DontRedraw
+        } else {
+            Redraw
+        }
+    }
+}
+
+image_api!(AppState::resources);
+font_api!(AppState::resources);
+text_api!(AppState::resources);
+clipboard_api!(AppState::resources);
+
+/// Render the contents of one single window.
+/// Returns (if the event was a resize event, if the window was closed)
+fn render_single_window_content<T: Layout>(
+    config: &AppConfig,
+    events: &[WindowEvent],
+    window_id: &GliumWindowId,
+    window: &mut Window<T>,
+    app_state: &mut AppState<T>,
+    ui_state_cache: &mut BTreeMap<GliumWindowId, UiState<T>>,
+    ui_description_cache: &mut BTreeMap<GliumWindowId, UiDescription<T>>,
+    force_redraw_cache: &mut BTreeMap<GliumWindowId, usize>,
+    awakened_task: &mut BTreeMap<GliumWindowId, bool>,
+) -> Result<(bool, bool), RuntimeError<T>> {
+
+    use self::RuntimeError::*;
+
+    if events.is_empty() && force_redraw_cache[window_id] == 0 {
+        // Event was not a resize event, window should **not** close
+        return Ok((false, false));
+    }
+
+    let (mut frame_event_info, window_should_close) = window.state.update_window_state(&events);
 
     if window_should_close {
-        let window_should_close = true;
-        return Ok((frame_was_resize, window_should_close));
+        // Event was not a resize event, window should close
+        return Ok((false, true));
     }
 
     let mut hit_test_results = None;
 
     if frame_event_info.should_hittest {
 
-        hit_test_results = do_hit_test(&window);
+        hit_test_results = do_hit_test(&window, &app_state.resources);
 
-        for event in &events {
+        for event in events.iter() {
 
             let callback_result = call_callbacks(
                 hit_test_results.as_ref(),
@@ -409,15 +637,15 @@ fn render_single_window_content<T: Layout>(
             // callbacks that return `Some()` would get immediately overwritten again
             // by callbacks that return `None`.
             if let Some(overwrites_focus) = callback_result.callbacks_overwrites_focus {
-                window.state.pending_focus_target = Some(overwrites_focus);
+                window.state.internal.pending_focus_target = Some(overwrites_focus);
             }
         }
     }
 
     // Scroll for the scrolled amount for each node that registered a scroll state.
-    render_on_scroll(window, hit_test_results, &frame_event_info);
+    let should_scroll_render = update_scroll_state(window, hit_test_results, &mut app_state.resources);
 
-    if frame_event_info.is_resize_event || frame_event_info.should_redraw_window {
+    if frame_event_info.is_resize_event {
         // This is a hack because during a resize event, winit eats the "awakened"
         // event. So what we do is that we call the layout-and-render again, to
         // trigger a second "awakened" event. So when the window is resized, the
@@ -425,10 +653,13 @@ fn render_single_window_content<T: Layout>(
         //
         // This is a reported bug and should be fixed somewhere in July
         *force_redraw_cache.get_mut(window_id).ok_or(WindowIndexError)? = 2;
-        frame_was_resize = true;
     }
 
-    #[cfg(target_os = "linux")] {
+    // See: https://docs.rs/glutin/0.19.0/glutin/struct.CombinedContext.html#method.resize
+    //
+    // Some platforms (macOS, Wayland) require being manually updated when their window
+    // or surface is resized.
+    #[cfg(not(target_os = "windows"))] {
         if frame_event_info.is_resize_event {
             // Resize gl window
             let gl_window = window.display.gl_window();
@@ -439,75 +670,71 @@ fn render_single_window_content<T: Layout>(
 
     // Update the window state that we got from the frame event (updates window dimensions and DPI)
     // Sets frame_event_info.needs redraw if the event was a
-    window.update_from_external_window_state(&mut frame_event_info);
+    window.update_from_external_window_state(&mut frame_event_info, &app_state.resources.fake_display.hidden_events_loop);
     // Update the window state every frame that was set by the user
     window.update_from_user_window_state(app_state.windows[&window_id].state.clone());
     // Reset the scroll amount to 0 (for the next frame)
     window.clear_scroll_state();
 
-    // Call the Layout::layout() fn, get the DOM
-    *ui_state_cache.get_mut(window_id).ok_or(WindowIndexError)? =
-        UiState::from_app_state(app_state, window_id)?;
+    // If there is already a layout construction in progress, prevent
+    // re-rendering on layout, otherwise this leads to jankiness during scrolling
+    let should_relayout = frame_event_info.should_redraw_window || awakened_task[window_id] || force_redraw_cache[window_id] > 0;
+    let should_rerender = should_scroll_render || frame_event_info.is_resize_event;
 
-    // Style the DOM (is_mouse_down is necessary for styling :hover, :active + :focus nodes)
-    let is_mouse_down = window.state.mouse_state.mouse_down();
+    if should_relayout || should_rerender {
 
-    *ui_description_cache.get_mut(window_id).ok_or(WindowIndexError)? =
-        UiDescription::match_css_to_dom(
-            ui_state_cache.get_mut(window_id).ok_or(WindowIndexError)?,
-            &window.css,
-            &mut window.state.focused_node,
-            &mut window.state.pending_focus_target,
-            &window.state.hovered_nodes,
-            is_mouse_down,
+        // Call the Layout::layout() fn, get the DOM
+        *ui_state_cache.get_mut(window_id).ok_or(WindowIndexError)? =
+            UiState::from_app_state(app_state, window_id)?;
+
+        // Style the DOM (is_mouse_down is necessary for styling :hover, :active + :focus nodes)
+        let is_mouse_down = window.state.internal.mouse_state.mouse_down();
+
+        *ui_description_cache.get_mut(window_id).ok_or(WindowIndexError)? =
+            UiDescription::match_css_to_dom(
+                ui_state_cache.get_mut(window_id).ok_or(WindowIndexError)?,
+                &window.css,
+                &mut window.state.internal.focused_node,
+                &mut window.state.internal.pending_focus_target,
+                &window.state.internal.hovered_nodes,
+                is_mouse_down,
+            );
+
+        // Render the window (webrender will send an Awakened event when the frame is done)
+        let mut fake_window = app_state.windows.get_mut(window_id).ok_or(WindowIndexError)?;
+        update_display_list(
+            &mut app_state.data,
+            &ui_description_cache[window_id],
+            &ui_state_cache[window_id],
+            &mut *window,
+            &mut fake_window,
+            &mut app_state.resources,
         );
+        *awakened_task.get_mut(window_id).ok_or(WindowIndexError)? = false;
 
-    // Render the window (webrender will send an Awakened event when the frame is done)
-    let mut fake_window = app_state.windows.get_mut(window_id).ok_or(WindowIndexError)?;
-    render(
-        &mut app_state.data,
-        &ui_description_cache[window_id],
-        &ui_state_cache[window_id],
-        &mut *window,
-        &mut fake_window,
-        &mut app_state.resources,
-    );
-
-    // NOTE: render() blocks on rendering, so swapping the buffer has to happen after rendering!
-    if frame_event_info.should_redraw_window || frame_event_info.is_resize_event || awakened_task[window_id] || force_redraw_cache[window_id] > 0 {
-        if frame_event_info.should_redraw_window || frame_event_info.is_resize_event || awakened_task[window_id] || force_redraw_cache[window_id] == 1 {
-            window.display.swap_buffers()?;
-            // The initial setup can lead to flickering / flasthing during startup, this
-            // prevents flickering on startup
-            if window.create_options.state.is_visible && window.state.is_visible {
-                window.display.gl_window().window().show();
-                window.state.is_visible = true;
-                window.create_options.state.is_visible = false;
-            }
-        }
         if let Some(i) = force_redraw_cache.get_mut(window_id) {
             if *i > 0 { *i -= 1 };
             if *i == 1 {
-                clean_up_unused_opengl_textures(window.renderer.as_mut().unwrap().flush_pipeline_info());
+                clean_up_unused_opengl_textures(app_state.resources.fake_display.renderer.as_mut().unwrap().flush_pipeline_info());
             }
         }
     }
 
-    if force_redraw_cache[window_id] == 1 || frame_event_info.is_resize_event || awakened_task[window_id] {
-        *awakened_task.get_mut(window_id).ok_or(WindowIndexError)? = false;
-    }
+    // TODO: Render all windows again, not just this one!
+    // if should_relayout || should_rerender {
+        render_inner(window, &mut app_state.resources, Transaction::new(), config.background_color);
+    // }
 
-    let window_should_close = false;
-    Ok((frame_was_resize, window_should_close))
+    Ok((frame_event_info.is_resize_event, false))
 }
 
 /// Returns if there was an error with the CSS reloading, necessary so that the error message is only printed once
 #[cfg(debug_assertions)]
 fn hot_reload_css<T: Layout>(
-    windows: &mut BTreeMap<WindowId, Window<T>>,
+    windows: &mut BTreeMap<GliumWindowId, Window<T>>,
     last_style_reload: &mut Instant,
     should_print_error: &mut bool,
-    awakened_tasks: &mut BTreeMap<WindowId, bool>)
+    awakened_tasks: &mut BTreeMap<GliumWindowId, bool>)
 -> Result<(), RuntimeError<T>>
 {
     use self::RuntimeError::*;
@@ -532,7 +759,7 @@ fn hot_reload_css<T: Layout>(
                     println!("--- OK: CSS parsed without errors, continuing hot-reload.");
                 }
                 *last_style_reload = Instant::now();
-                window.events_loop.create_proxy().wakeup().unwrap_or(());
+                // window.events_loop.create_proxy().wakeup().unwrap_or(());
                 *awakened_tasks.get_mut(window_id).ok_or(WindowIndexError)? = true;
 
                 *should_print_error = true;
@@ -550,12 +777,12 @@ fn hot_reload_css<T: Layout>(
 }
 
 /// Returns the currently hit-tested results, in back-to-front order
-fn do_hit_test<T: Layout>(window: &Window<T>) -> Option<HitTestResult> {
+fn do_hit_test<T: Layout>(window: &Window<T>, app_resources: &AppResources) -> Option<HitTestResult> {
 
-    let cursor_location = window.state.mouse_state.cursor_pos
+    let cursor_location = window.state.internal.mouse_state.cursor_pos
         .map(|pos| WorldPoint::new(pos.x as f32, pos.y as f32))?;
 
-    let mut hit_test_results = window.internal.api.hit_test(
+    let mut hit_test_results = app_resources.fake_display.render_api.hit_test(
         window.internal.document_id,
         Some(window.internal.pipeline_id),
         cursor_location,
@@ -582,18 +809,15 @@ struct CallCallbackReturn {
 /// Returns an bool whether the window should be redrawn or not (true - redraw the screen, false: don't redraw).
 fn call_callbacks<T: Layout>(
     hit_test_results: Option<&HitTestResult>,
-    event: &Event,
+    event: &WindowEvent,
     window: &mut Window<T>,
-    window_id: &WindowId,
+    window_id: &GliumWindowId,
     ui_state: &UiState<T>,
     app_state: &mut AppState<T>)
 -> Result<CallCallbackReturn, RuntimeError<T>>
 {
     use {
-        FastHashMap,
-        app_state::AppStateNoData,
-        window::CallbackInfo,
-        dom::{Redraw, DontRedraw},
+        callbacks::CallbackInfo,
         window_state::{KeyboardState, MouseState},
         self::RuntimeError::*,
     };
@@ -606,13 +830,13 @@ fn call_callbacks<T: Layout>(
 
     // TODO: this should be refactored - currently very stateful and error-prone!
     app_state.windows.get_mut(window_id).ok_or(WindowIndexError)?
-        .set_keyboard_state(&window.state.keyboard_state);
+        .set_keyboard_state(&window.state.internal.keyboard_state);
     app_state.windows.get_mut(window_id).ok_or(WindowIndexError)?
-        .set_mouse_state(&window.state.mouse_state);
+        .set_mouse_state(&window.state.internal.mouse_state);
 
     let mut callbacks_overwrites_focus = None;
 
-    let mut default_daemons = FastHashMap::default();
+    let mut default_timers = FastHashMap::default();
     let mut default_tasks = Vec::new();
 
     // Run all default callbacks - **before** the user-defined callbacks are run!
@@ -636,7 +860,7 @@ fn call_callbacks<T: Layout>(
                 let mut app_state_no_data = AppStateNoData {
                     windows: &app_state.windows,
                     resources: &mut app_state.resources,
-                    daemons: FastHashMap::default(),
+                    timers: FastHashMap::default(),
                     tasks: Vec::new(),
                 };
 
@@ -649,7 +873,7 @@ fn call_callbacks<T: Layout>(
                     should_update_screen = Redraw;
                 }
 
-                default_daemons.extend(app_state_no_data.daemons.into_iter());
+                default_timers.extend(app_state_no_data.timers.into_iter());
                 default_tasks.extend(app_state_no_data.tasks.into_iter());
 
                 // Overwrite the focus from the callback info
@@ -660,9 +884,9 @@ fn call_callbacks<T: Layout>(
         }
     }
 
-    // If the default callbacks have started daemons or tasks, add them to the main app state
-    for (daemon_id, daemon) in default_daemons {
-        app_state.add_daemon(daemon_id, daemon);
+    // If the default callbacks have started timers or tasks, add them to the main app state
+    for (timer_id, timer) in default_timers {
+        app_state.add_timer(timer_id, timer);
     }
 
     for task in default_tasks {
@@ -708,21 +932,22 @@ fn call_callbacks<T: Layout>(
     })
 }
 
-fn render<T: Layout>(
+/// Build the display list and send it to webrender
+fn update_display_list<T: Layout>(
     app_data: &mut Arc<Mutex<T>>,
     ui_description: &UiDescription<T>,
     ui_state: &UiState<T>,
     window: &mut Window<T>,
     fake_window: &mut FakeWindow<T>,
-    app_resources: &mut AppResources)
-{
+    app_resources: &mut AppResources,
+) {
     use display_list::DisplayList;
-
-    use webrender::api::{Transaction, DeviceIntRect, DeviceIntPoint};
 
     let display_list = DisplayList::new_from_ui_description(ui_description, ui_state);
 
-    let (builder, scrolled_nodes) = display_list.into_display_list_builder(
+    // NOTE: layout_result contains all words, text information, etc.
+    // - very important for selection!
+    let (builder, scrolled_nodes, _layout_result) = display_list.into_display_list_builder(
         app_data,
         window,
         fake_window,
@@ -730,36 +955,21 @@ fn render<T: Layout>(
     );
 
     // NOTE: Display list has to be rebuilt every frame, otherwise, the epochs get out of sync
-    window.internal.last_display_list_builder = builder.finalize().2;
+    let display_list_builder = builder.finalize().2;
     window.internal.last_scrolled_nodes = scrolled_nodes;
 
-    let (logical_size, framebuffer_size) = convert_window_size(&window.state.size);
+    let (logical_size, _) = convert_window_size(&window.state.size);
 
-    let webrender_transaction = {
-        let mut txn = Transaction::new();
+    let mut txn = Transaction::new();
+    txn.set_display_list(
+        window.internal.epoch,
+        None,
+        logical_size.clone(),
+        (window.internal.pipeline_id, logical_size, display_list_builder),
+        true,
+    );
 
-        // Send webrender the size and buffer of the display
-        let bounds = DeviceIntRect::new(DeviceIntPoint::new(0, 0), framebuffer_size);
-        txn.set_window_parameters(framebuffer_size, bounds, window.state.size.hidpi_factor as f32);
-
-        txn.set_display_list(
-            window.internal.epoch,
-            None,
-            logical_size,
-            (window.internal.pipeline_id, logical_size, window.internal.last_display_list_builder.clone()),
-            true,
-        );
-
-        txn.set_root_pipeline(window.internal.pipeline_id);
-        scroll_all_nodes(&mut window.scroll_states, &mut txn);
-        txn.generate_frame();
-        txn
-    };
-
-    window.internal.epoch = increase_epoch(window.internal.epoch);
-    window.internal.api.send_transaction(window.internal.document_id, webrender_transaction);
-    window.renderer.as_mut().unwrap().update();
-    render_inner(window, framebuffer_size);
+    app_resources.fake_display.render_api.send_transaction(window.internal.document_id, txn);
 }
 
 /// Scroll all nodes in the ScrollStates to their correct position and insert
@@ -790,71 +1000,50 @@ fn convert_window_size(size: &WindowSize) -> (LayoutSize, DeviceIntSize) {
 /// hit-testing and rendering - called on pure scroll events, since it's
 /// significantly less CPU-intensive to just render the last display list instead of
 /// re-layouting on every single scroll event.
-fn render_on_scroll<T: Layout>(
+#[must_use]
+fn update_scroll_state<T: Layout>(
     window: &mut Window<T>,
     hit_test_results: Option<HitTestResult>,
-    frame_event_info: &FrameEventInfo)
-{
+    app_resources: &mut AppResources,
+) -> bool {
+
     const SCROLL_THRESHOLD: f64 = 0.5; // px
 
     let hit_test_results = match hit_test_results {
         Some(s) => s,
-        None => match do_hit_test(&window) {
+        None => match do_hit_test(&window, app_resources) {
             Some(s) => s,
-            None => return,
+            None => return false,
         }
     };
 
-    let scroll_x = window.state.mouse_state.scroll_x;
-    let scroll_y = window.state.mouse_state.scroll_y;
+    let scroll_x = window.state.internal.mouse_state.scroll_x;
+    let scroll_y = window.state.internal.mouse_state.scroll_y;
 
     if scroll_x.abs() < SCROLL_THRESHOLD && scroll_y.abs() < SCROLL_THRESHOLD {
-        return;
+        return false;
     }
 
     let mut should_scroll_render = false;
 
-    {
-        let scrolled_nodes = &window.internal.last_scrolled_nodes;
-        let scroll_states = &mut window.scroll_states;
+    let scrolled_nodes = &window.internal.last_scrolled_nodes;
+    let scroll_states = &mut window.scroll_states;
 
-        for scroll_node in hit_test_results.items.iter()
-            .filter_map(|item| scrolled_nodes.tags_to_node_ids.get(&ScrollTagId(item.tag.0)))
-            .filter_map(|node_id| scrolled_nodes.overflowing_nodes.get(&node_id)) {
+    for scroll_node in hit_test_results.items.iter()
+        .filter_map(|item| scrolled_nodes.tags_to_node_ids.get(&ScrollTagId(item.tag.0)))
+        .filter_map(|node_id| scrolled_nodes.overflowing_nodes.get(&node_id)) {
 
-            // The external scroll ID is constructed from the DOM hash
-            let scroll_id = scroll_node.parent_external_scroll_id;
+        // The external scroll ID is constructed from the DOM hash
+        let scroll_id = scroll_node.parent_external_scroll_id;
 
-            if scroll_states.0.contains_key(&scroll_id) {
-                // TODO: make scroll speed configurable (system setting?)
-                scroll_states.scroll_node(&scroll_id, scroll_x as f32, scroll_y as f32);
-                should_scroll_render = true;
-            }
+        if scroll_states.0.contains_key(&scroll_id) {
+            // TODO: make scroll speed configurable (system setting?)
+            scroll_states.scroll_node(&scroll_id, scroll_x as f32, scroll_y as f32);
+            should_scroll_render = true;
         }
     }
 
-    // If there is already a layout construction in progress, prevent
-    // re-rendering on layout, otherwise this leads to jankiness during scrolling
-    if !frame_event_info.should_redraw_window && should_scroll_render {
-        render_on_scroll_no_layout(window);
-    }
-}
-
-fn render_on_scroll_no_layout<T: Layout>(window: &mut Window<T>) {
-
-    use webrender::api::*;
-
-    let mut txn = Transaction::new();
-
-    scroll_all_nodes(&mut window.scroll_states, &mut txn);
-
-    txn.generate_frame();
-
-    window.internal.api.send_transaction(window.internal.document_id, txn);
-    window.renderer.as_mut().unwrap().update();
-
-    let (_, physical_size) = convert_window_size(&window.state.size);
-    render_inner(window, physical_size);
+    should_scroll_render
 }
 
 fn clean_up_unused_opengl_textures(pipeline_info: PipelineInfo) {
@@ -898,21 +1087,310 @@ fn increase_epoch(old: Epoch) -> Epoch {
     }
 }
 
-// See: https://github.com/servo/webrender/pull/2880
-// webrender doesn't reset the active shader back to what it was, but rather sets it
-// to zero, which glium doesn't know about, so on the next frame it tries to draw with shader 0
+// Function wrapper that is invoked on scrolling and normal rendering - only renders the
+// window contents and updates the screen, assumes that all transactions via the RenderApi
+// have been committed before this function is called.
 //
-// For some reason, webrender allows rendering negative width / height, although that doesn't make sense
-fn render_inner<T: Layout>(window: &mut Window<T>, framebuffer_size: DeviceIntSize) {
+// WebRender doesn't reset the active shader back to what it was, but rather sets it
+// to zero, which glium doesn't know about, so on the next frame it tries to draw with shader 0.
+// This leads to problems when invoking GlTextureCallbacks, because those don't expect
+// the OpenGL state to change between calls. Also see: https://github.com/servo/webrender/pull/2880
+//
+// NOTE: For some reason, webrender allows rendering to a framebuffer with a
+// negative width / height, although that doesn't make sense
+fn render_inner<T: Layout>(
+    window: &mut Window<T>,
+    app_resources: &mut AppResources,
+    mut txn: Transaction,
+    background_color: ColorU,
+) {
 
-    use gleam::gl;
     use window::get_gl_context;
+    use glium::glutin::ContextTrait;
+    use webrender::api::{DeviceIntRect, DeviceIntPoint};
+    use azul_css::ColorF;
 
-    // use glium::glutin::GlContext;
-    // unsafe { window.display.gl_window().make_current().unwrap(); }
+    let (_, framebuffer_size) = convert_window_size(&window.state.size);
 
-    let mut current_program = [0_i32];
-    unsafe { get_gl_context(&window.display).unwrap().get_integer_v(gl::CURRENT_PROGRAM, &mut current_program) };
-    window.renderer.as_mut().unwrap().render(framebuffer_size).unwrap();
-    get_gl_context(&window.display).unwrap().use_program(current_program[0] as u32);
+    // Especially during minimization / maximization of a window, it can happen that the window
+    // width or height is zero. In that case, no rendering is necessary (doing so would crash
+    // the application, since glTexImage2D may never have a 0 as the width or height.
+    if framebuffer_size.width == 0 || framebuffer_size.height == 0 {
+        return;
+    }
+
+    window.internal.epoch = increase_epoch(window.internal.epoch);
+
+    txn.set_window_parameters(
+        framebuffer_size.clone(),
+        DeviceIntRect::new(DeviceIntPoint::new(0, 0), framebuffer_size),
+        window.state.size.hidpi_factor as f32
+    );
+    txn.set_root_pipeline(window.internal.pipeline_id);
+    scroll_all_nodes(&mut window.scroll_states, &mut txn);
+    txn.generate_frame();
+
+    app_resources.fake_display.render_api.send_transaction(window.internal.document_id, txn);
+
+    // Update WR texture cache
+    app_resources.fake_display.renderer.as_mut().unwrap().update();
+
+    let background_color_f: ColorF = background_color.into();
+
+    unsafe {
+
+        // NOTE: GlContext is the context of the app-global, hidden window
+        // (that shares the renderer), not the context of the window itself.
+        let gl_context = get_gl_context(&app_resources.fake_display.hidden_display).unwrap();
+
+        // NOTE: The `hidden_display` must share the OpenGL context with the `window`,
+        // otherwise this will segfault! Use `ContextBuilder::with_shared_lists` to share the
+        // OpenGL context across different windows.
+        //
+        // The context **must** be made current before calling `.bind_framebuffer()`,
+        // otherwise EGL will panic with EGL_BAD_MATCH. The current context has to be the
+        // hidden_display context, otherwise this will segfault on Windows.
+        app_resources.fake_display.hidden_display.gl_window().make_current().unwrap();
+
+        let mut current_program = [0_i32];
+        gl_context.get_integer_v(gl::CURRENT_PROGRAM, &mut current_program);
+
+        // Generate a framebuffer (that will contain the final, rendered screen output).
+        let framebuffers = gl_context.gen_framebuffers(1);
+        gl_context.bind_framebuffer(gl::FRAMEBUFFER, framebuffers[0]);
+
+        // Create the texture to render to
+        let textures = gl_context.gen_textures(1);
+
+        gl_context.bind_texture(gl::TEXTURE_2D, textures[0]);
+        gl_context.tex_image_2d(gl::TEXTURE_2D, 0, gl::RGB as i32, framebuffer_size.width, framebuffer_size.height, 0, gl::RGB, gl::UNSIGNED_BYTE, None);
+
+        gl_context.tex_parameter_i(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as i32);
+        gl_context.tex_parameter_i(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as i32);
+        gl_context.tex_parameter_i(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
+        gl_context.tex_parameter_i(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
+
+        let depthbuffers = gl_context.gen_renderbuffers(1);
+        gl_context.bind_renderbuffer(gl::RENDERBUFFER, depthbuffers[0]);
+        gl_context.renderbuffer_storage(gl::RENDERBUFFER, gl::DEPTH_COMPONENT, framebuffer_size.width, framebuffer_size.height);
+        gl_context.framebuffer_renderbuffer(gl::FRAMEBUFFER, gl::DEPTH_ATTACHMENT, gl::RENDERBUFFER, depthbuffers[0]);
+
+        // Set "textures[0]" as the color attachement #0
+        gl_context.framebuffer_texture_2d(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, textures[0], 0);
+
+        gl_context.draw_buffers(&[gl::COLOR_ATTACHMENT0]);
+
+        // Check that the framebuffer is complete
+        assert_eq!(gl_context.check_frame_buffer_status(gl::FRAMEBUFFER), gl::FRAMEBUFFER_COMPLETE);
+
+        // Invoke WebRender to render the frame - renders to the currently bound FB
+        gl_context.clear_color(background_color_f.r, background_color_f.g, background_color_f.b, background_color_f.a);
+        gl_context.clear_depth(0.0);
+
+        // Disable SRGB and multisample, otherwise, WebRender will crash
+        gl_context.disable(gl::FRAMEBUFFER_SRGB);
+        gl_context.disable(gl::MULTISAMPLE);
+        gl_context.disable(gl::POLYGON_SMOOTH);
+
+        app_resources.fake_display.renderer.as_mut().unwrap().render(framebuffer_size).unwrap();
+
+        gl_context.delete_framebuffers(&framebuffers);
+        gl_context.delete_renderbuffers(&depthbuffers);
+
+        // FBOs can't be shared between windows, but textures can.
+        // In order to draw on the windows backbuffer, first make the window current, then draw to FB 0
+        window.display.gl_window().make_current().unwrap();
+        let window_context = get_gl_context(&window.display).unwrap();
+        draw_texture_to_screen(&*window_context, textures[0], framebuffer_size);
+        window.display.swap_buffers().unwrap();
+
+        app_resources.fake_display.hidden_display.gl_window().make_current().unwrap();
+
+        // Only delete the texture here...
+        gl_context.delete_textures(&textures);
+
+        gl_context.bind_framebuffer(gl::FRAMEBUFFER, 0);
+        gl_context.bind_texture(gl::TEXTURE_2D, 0);
+        gl_context.use_program(current_program[0] as u32);
+
+    };
+
+    // The initial setup can lead to flickering during startup, by default
+    // the window is hidden until the first frame has been rendered.
+    if window.create_options.state.is_visible && window.state.is_visible {
+        window.display.gl_window().window().show();
+        window.state.is_visible = true;
+        window.create_options.state.is_visible = false;
+    }
+}
+
+/// When called with glDrawArrays(0, 3), generates a simple triangle that
+/// spans the whole screen.
+const DISPLAY_VERTEX_SHADER: &[u8] = b"
+    #version 140
+    out vec2 vTexCoords;
+    void main() {
+        float x = -1.0 + float((gl_VertexID & 1) << 2);
+        float y = -1.0 + float((gl_VertexID & 2) << 1);
+        vTexCoords = vec2((x+1.0)*0.5, (y+1.0)*0.5);
+        gl_Position = vec4(x, y, 0, 1);
+    }
+\0";
+
+/// Shader that samples an input texture (`fScreenTex`) to the output FB.
+const DISPLAY_FRAGMENT_SHADER: &[u8] = b"
+    #version 140
+    in vec2 vTexCoords;
+    uniform sampler2D fScreenTex;
+    out vec4 fColorOut;
+
+    void main() {
+        fColorOut = texture(fScreenTex, vTexCoords);
+    }
+\0";
+
+// NOTE: Compilation is thread-unsafe, should only be compiled on the main thread
+static mut DISPLAY_SHADER: Option<GLuint> = None;
+
+/// Compiles the display vertex / fragment shader, returns the compiled shaders.
+fn compile_screen_shader(context: &Gl) -> GLuint {
+
+    unsafe {
+        match DISPLAY_SHADER {
+            Some(s) => return s,
+            None => { },
+        }
+    }
+
+    let vertex_shader_object = context.create_shader(gl::VERTEX_SHADER);
+    context.shader_source(vertex_shader_object, &[DISPLAY_VERTEX_SHADER]);
+    context.compile_shader(vertex_shader_object);
+    if get_gl_shader_error(context, vertex_shader_object) {
+        let err = context.get_shader_info_log(vertex_shader_object);
+        context.delete_shader(vertex_shader_object);
+        panic!("VS compile error: {}", err);
+    }
+
+    let fragment_shader_object = context.create_shader(gl::FRAGMENT_SHADER);
+    context.shader_source(fragment_shader_object, &[DISPLAY_FRAGMENT_SHADER]);
+    context.compile_shader(fragment_shader_object);
+    if get_gl_shader_error(context, fragment_shader_object) {
+        let err = context.get_shader_info_log(fragment_shader_object);
+        context.delete_shader(vertex_shader_object);
+        context.delete_shader(fragment_shader_object);
+        panic!("FS compile error: {}", err);
+    }
+
+    let program = context.create_program();
+    context.attach_shader(program, vertex_shader_object);
+    context.attach_shader(program, fragment_shader_object);
+    context.link_program(program);
+    if get_gl_program_error(context, program) {
+        let err = context.get_program_info_log(program);
+        context.delete_shader(vertex_shader_object);
+        context.delete_shader(fragment_shader_object);
+        context.delete_program(program);
+        panic!("Program link error: {}", err);
+    }
+
+    // context.detach_shader(program, vertex_shader_object);
+    // context.detach_shader(program, fragment_shader_object);
+    context.delete_shader(vertex_shader_object);
+    context.delete_shader(fragment_shader_object);
+
+    unsafe { DISPLAY_SHADER = Some(program) };
+
+    program
+}
+
+// Returns true on error, false otherwise
+fn get_gl_shader_error(context: &Gl, shader_object: GLuint) -> bool {
+    let mut err = [0];
+    unsafe { context.get_shader_iv(shader_object, gl::COMPILE_STATUS, &mut err) };
+    err[0] == 0
+}
+
+fn get_gl_program_error(context: &Gl, shader_object: GLuint) -> bool {
+    let mut err = [0];
+    unsafe { context.get_program_iv(shader_object, gl::LINK_STATUS, &mut err) };
+    err[0] == 0
+}
+
+// Draws a texture to the currently bound framebuffer. Texture has to be cleaned up by the caller.
+fn draw_texture_to_screen(context: &Gl, texture: GLuint, framebuffer_size: DeviceIntSize) {
+
+    context.bind_framebuffer(gl::FRAMEBUFFER, 0);
+
+    // Compile or get the cached shader
+    let shader = compile_screen_shader(context);
+    let texture_location = context.get_uniform_location(shader, "fScreenTex");
+
+    // The uniform value for a sampler refers to the texture unit, not the texture id, i.e.:
+    //
+    // TEXTURE0 = uniform_1i(location, 0);
+    // TEXTURE1 = uniform_1i(location, 1);
+
+    context.active_texture(gl::TEXTURE0);
+    context.bind_texture(gl::TEXTURE_2D, texture);
+    context.use_program(shader);
+    context.uniform_1i(texture_location, 0);
+
+    // The vertices are generated in the vertex shader using gl_VertexID, however,
+    // drawing without a VAO is not allowed (except for glDrawArraysInstanced,
+    // which is only available in OGL 3.3)
+
+    let vao = context.gen_vertex_arrays(1);
+    context.bind_vertex_array(vao[0]);
+    context.viewport(0, 0, framebuffer_size.width, framebuffer_size.height);
+    context.draw_arrays(gl::TRIANGLE_STRIP, 0, 3);
+    context.delete_vertex_arrays(&vao);
+
+    context.bind_vertex_array(0);
+    context.use_program(0);
+    context.bind_texture(gl::TEXTURE_2D, 0);
+}
+
+fn set_webrender_debug_flags(r: &mut Renderer, old_flags: &DebugState, new_flags: &DebugState) {
+
+    use webrender::DebugFlags;
+
+    if old_flags.profiler_dbg != new_flags.profiler_dbg {
+        r.set_debug_flag(DebugFlags::PROFILER_DBG, new_flags.profiler_dbg);
+    }
+    if old_flags.render_target_dbg != new_flags.render_target_dbg {
+        r.set_debug_flag(DebugFlags::RENDER_TARGET_DBG, new_flags.render_target_dbg);
+    }
+    if old_flags.texture_cache_dbg != new_flags.texture_cache_dbg {
+        r.set_debug_flag(DebugFlags::TEXTURE_CACHE_DBG, new_flags.texture_cache_dbg);
+    }
+    if old_flags.gpu_time_queries != new_flags.gpu_time_queries {
+        r.set_debug_flag(DebugFlags::GPU_TIME_QUERIES, new_flags.gpu_time_queries);
+    }
+    if old_flags.gpu_sample_queries != new_flags.gpu_sample_queries {
+        r.set_debug_flag(DebugFlags::GPU_SAMPLE_QUERIES, new_flags.gpu_sample_queries);
+    }
+    if old_flags.disable_batching != new_flags.disable_batching {
+        r.set_debug_flag(DebugFlags::DISABLE_BATCHING, new_flags.disable_batching);
+    }
+    if old_flags.epochs != new_flags.epochs {
+        r.set_debug_flag(DebugFlags::EPOCHS, new_flags.epochs);
+    }
+    if old_flags.compact_profiler != new_flags.compact_profiler {
+        r.set_debug_flag(DebugFlags::COMPACT_PROFILER, new_flags.compact_profiler);
+    }
+    if old_flags.echo_driver_messages != new_flags.echo_driver_messages {
+        r.set_debug_flag(DebugFlags::ECHO_DRIVER_MESSAGES, new_flags.echo_driver_messages);
+    }
+    if old_flags.new_frame_indicator != new_flags.new_frame_indicator {
+        r.set_debug_flag(DebugFlags::NEW_FRAME_INDICATOR, new_flags.new_frame_indicator);
+    }
+    if old_flags.new_scene_indicator != new_flags.new_scene_indicator {
+        r.set_debug_flag(DebugFlags::NEW_SCENE_INDICATOR, new_flags.new_scene_indicator);
+    }
+    if old_flags.show_overdraw != new_flags.show_overdraw {
+        r.set_debug_flag(DebugFlags::SHOW_OVERDRAW, new_flags.show_overdraw);
+    }
+    if old_flags.gpu_cache_dbg != new_flags.gpu_cache_dbg {
+        r.set_debug_flag(DebugFlags::GPU_CACHE_DBG, new_flags.gpu_cache_dbg);
+    }
 }

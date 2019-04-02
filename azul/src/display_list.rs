@@ -1,63 +1,48 @@
 #![allow(unused_variables)]
-#![allow(unused_macros)]
 
 use std::{
     fmt,
     sync::{Arc, Mutex},
     collections::BTreeMap,
 };
-use app_units::{AU_PER_PX, MIN_AU, MAX_AU, Au};
 use euclid::{TypedRect, TypedSize2D};
-use glium::glutin::dpi::{LogicalPosition, LogicalSize};
 use webrender::api::{
-    LayoutPixel, RenderApi, FontInstanceKey,
-    DisplayListBuilder, PrimitiveInfo, GradientStop, ColorF, PipelineId, Epoch,
-    ImageData, ImageKey, ImageDescriptor, ResourceUpdate, AddImage, AddFontInstance,
-    AddFont, BorderRadius, ClipMode, LayoutPoint, LayoutSize,
-    GlyphOptions, LayoutRect, BorderSide, FontKey, ExternalScrollId,
-    NormalBorder, ComplexClipRegion, LayoutPrimitiveInfo, ExternalImageId,
+    LayoutPixel, DisplayListBuilder, PrimitiveInfo, GradientStop,
+    ColorF, PipelineId, Epoch, ImageData, ImageDescriptor,
+    ResourceUpdate, AddImage, BorderRadius, ClipMode,
+    LayoutPoint, LayoutSize, GlyphOptions, LayoutRect, ExternalScrollId,
+    ComplexClipRegion, LayoutPrimitiveInfo, ExternalImageId,
     ExternalImageData, ImageFormat, ExternalImageType, TextureTarget,
-    ImageRendering, AlphaType, FontInstanceFlags, FontRenderMode, BorderDetails,
-    ColorU, BorderStyle,
+    ImageRendering, AlphaType, FontInstanceFlags, FontRenderMode,
 };
 use azul_css::{
-    Css, StyleTextAlignmentHorz, LayoutPosition,CssProperty, LayoutOverflow,
-    StyleFontSize, StyleBorderRadius, PixelValue, FloatValue, LayoutMargin,
-    StyleTextColor, StyleBackground, StyleBoxShadow, StyleBackgroundColor,
+    Css, LayoutPosition,CssProperty, LayoutOverflow,
+    StyleBorderRadius, LayoutMargin, LayoutPadding, BoxShadowClipMode,
+    StyleTextColor, StyleBackground, StyleBoxShadow,
     StyleBackgroundSize, StyleBackgroundRepeat, StyleBorder, BoxShadowPreDisplayItem,
-    LayoutPadding, SizeMetric, BoxShadowClipMode, FontId, StyleTextAlignmentVert,
-    RectStyle, RectLayout, ColorU as StyleColorU
+    RectStyle, RectLayout, ColorU as StyleColorU, DynamicCssPropertyDefault,
 };
 use {
     FastHashMap,
     app_resources::AppResources,
-    default_callbacks::StackCheckedPointer,
+    callbacks::{IFrameCallback, GlTextureCallback, HidpiAdjustedBounds, StackCheckedPointer},
     traits::Layout,
     ui_state::UiState,
     ui_description::{UiDescription, StyledNode},
     id_tree::{NodeDataContainer, NodeId, NodeHierarchy},
     dom::{
-        IFrameCallback, NodeData, GlTextureCallback, ScrollTagId, DomHash, new_scroll_tag_id,
-        NodeType::{self, Div, Text, Image, GlTexture, IFrame, Label}
+        NodeData, ScrollTagId, DomHash, DomString, new_scroll_tag_id,
+        NodeType::{self, Div, Text, Image, GlTexture, IFrame, Label},
     },
-    text_layout::{TextOverflowPass2, ScrollbarInfo, Words, FontMetrics},
-    images::ImageId,
-    text_cache::TextInfo,
+    ui_solver::{do_the_layout, LayoutResult, PositionedRectangle},
+    app_resources::ImageId,
     compositor::new_opengl_texture_id,
-    window::{Window, LayoutInfo, FakeWindow, ScrollStates, HidpiAdjustedBounds},
+    window::{Window, FakeWindow, ScrollStates},
+    callbacks::LayoutInfo,
     window_state::WindowSize,
 };
 
 const DEFAULT_FONT_COLOR: StyleTextColor = StyleTextColor(StyleColorU { r: 0, b: 0, g: 0, a: 255 });
-
-// In case no font size is specified for a node,
-// this will be substituted as the default font size
-lazy_static! {
-    pub static ref DEFAULT_FONT_SIZE: StyleFontSize = StyleFontSize(PixelValue {
-        metric: SizeMetric::Px,
-        number: FloatValue::new(100.0),
-    });
-}
 
 pub(crate) struct DisplayList<'a, T: Layout + 'a> {
     pub(crate) ui_descr: &'a UiDescription<T>,
@@ -91,12 +76,7 @@ pub(crate) struct DisplayRectangle<'a> {
 impl<'a> DisplayRectangle<'a> {
     #[inline]
     pub fn new(tag: Option<u64>, styled_node: &'a StyledNode) -> Self {
-        Self {
-            tag: tag,
-            styled_node: styled_node,
-            style: RectStyle::default(),
-            layout: RectLayout::default(),
-        }
+        Self { tag, styled_node, style: RectStyle::default(), layout: RectLayout::default() }
     }
 }
 
@@ -107,11 +87,11 @@ impl<'a, T: Layout + 'a> DisplayList<'a, T> {
     /// This only looks at the user-facing styles of the `UiDescription`, not the actual
     /// layout. The layout is done only in the `into_display_list_builder` step.
     pub(crate) fn new_from_ui_description(ui_description: &'a UiDescription<T>, ui_state: &UiState<T>) -> Self {
-        let arena = ui_description.ui_descr_arena.borrow();
+        let arena = &ui_description.ui_descr_arena;
 
         let display_rect_arena = arena.node_data.transform(|node, node_id| {
-            let style = ui_description.styled_nodes.get(&node_id).unwrap_or(&ui_description.default_style_of_node);
-            let tag = ui_state.node_ids_to_tag_ids.get(&node_id).and_then(|tag| Some(*tag));
+            let style = &ui_description.styled_nodes[node_id];
+            let tag = ui_state.node_ids_to_tag_ids.get(&node_id).map(|tag| *tag);
             let mut rect = DisplayRectangle::new(tag, style);
             populate_css_properties(&mut rect, node_id, &ui_description.dynamic_css_overrides);
             rect
@@ -129,33 +109,49 @@ impl<'a, T: Layout + 'a> DisplayList<'a, T> {
         app_data_access: &mut Arc<Mutex<T>>,
         window: &mut Window<T>,
         fake_window: &mut FakeWindow<T>,
-        app_resources: &mut AppResources)
-    -> (DisplayListBuilder, ScrolledNodes)
-    {
+        app_resources: &mut AppResources
+    ) -> (DisplayListBuilder, ScrolledNodes, LayoutResult) {
+
         use glium::glutin::dpi::LogicalSize;
 
         let mut resource_updates = Vec::<ResourceUpdate>::new();
-        let arena = self.ui_descr.ui_descr_arena.borrow();
+
+        let arena = &self.ui_descr.ui_descr_arena;
         let node_hierarchy = &arena.node_layout;
         let node_data = &arena.node_data;
 
-        // Upload image and font resources
-        update_resources(&window.internal.api, app_resources, &mut resource_updates);
+        // Scan the styled DOM for image and font keys.
+        //
+        // The problem is that we need to scan all DOMs for image and font keys and insert them
+        // before the layout() step - however, can't call IFrameCallbacks upfront, because each
+        // IFrameCallback needs to know its size (so it has to be invoked after the layout() step).
+        // So, this process needs to follow an order like:
+        //
+        // - For each DOM to render:
+        //      - Create a DOM ID
+        //      - Style the DOM according to the stylesheet
+        //      - Scan all the font keys and image keys
+        //      - Insert the new font keys and image keys into the render API
+        //      - Scan all IFrameCallbacks, generate the DomID for each callback
+        //      - Repeat while number_of_iframe_callbacks != 0
+        app_resources.add_fonts_and_images(&self);
 
-        let (laid_out_rectangles, node_depths, word_cache) = do_the_layout(
+        let window_size = window.state.size.get_reverse_logical_size();
+        let layout_result = do_the_layout(
             node_hierarchy,
             node_data,
             &self.rectangles,
-            &mut resource_updates,
-            app_resources,
-            &window.internal.api,
-            window.state.size.get_reverse_logical_size(),
-            LogicalPosition::new(0.0, 0.0)
+            &*app_resources,
+            LayoutSize::new(window_size.width as f32, window_size.height as f32),
+            LayoutPoint::new(0.0, 0.0),
         );
 
+        // TODO: After the layout has been done, call all IFrameCallbacks and get and insert
+        // their font keys / image keys
+
         let mut scrollable_nodes = get_nodes_that_need_scroll_clip(
-            node_hierarchy, &self.rectangles, node_data, &laid_out_rectangles,
-            &node_depths, window.internal.pipeline_id
+            node_hierarchy, &self.rectangles, node_data, &layout_result.rects,
+            &layout_result.node_depths, window.internal.pipeline_id
         );
 
         // Make sure unused scroll states are garbage collected.
@@ -164,10 +160,9 @@ impl<'a, T: Layout + 'a> DisplayList<'a, T> {
         let LogicalSize { width, height } = window.state.size.dimensions;
         let mut builder = DisplayListBuilder::with_capacity(window.internal.pipeline_id, TypedSize2D::new(width as f32, height as f32), self.rectangles.len());
 
-        let rects_in_rendering_order = determine_rendering_order(node_hierarchy, &self.rectangles, &laid_out_rectangles);
+        let rects_in_rendering_order = determine_rendering_order(node_hierarchy, &self.rectangles, &layout_result.rects);
 
         push_rectangles_into_displaylist(
-            &laid_out_rectangles,
             window.internal.epoch,
             window.state.size,
             rects_in_rendering_order,
@@ -175,12 +170,11 @@ impl<'a, T: Layout + 'a> DisplayList<'a, T> {
             &mut window.scroll_states,
             &DisplayListParametersRef {
                 pipeline_id: window.internal.pipeline_id,
-                node_hierarchy: node_hierarchy,
-                node_data: node_data,
-                render_api: &window.internal.api,
+                node_hierarchy,
+                node_data,
                 display_rectangle_arena: &self.rectangles,
                 css: &window.css,
-                word_cache: &word_cache,
+                layout_result: &layout_result,
             },
             &mut DisplayListParametersMut {
                 app_data: app_data_access,
@@ -192,118 +186,7 @@ impl<'a, T: Layout + 'a> DisplayList<'a, T> {
             },
         );
 
-        &window.internal.api.update_resources(resource_updates);
-
-        (builder, scrollable_nodes)
-    }
-}
-
-/// Looks if any new images need to be uploaded and stores the in the image resources
-fn update_resources(
-    api: &RenderApi,
-    app_resources: &mut AppResources,
-    resource_updates: &mut Vec<ResourceUpdate>)
-{
-    update_image_resources(api, app_resources, resource_updates);
-    update_font_resources(api, app_resources, resource_updates);
-}
-
-fn update_image_resources(
-    api: &RenderApi,
-    app_resources: &mut AppResources,
-    resource_updates: &mut Vec<ResourceUpdate>)
-{
-    use images::{ImageState, ImageInfo};
-
-    let mut updated_images = Vec::<(ImageId, (ImageData, ImageDescriptor))>::new();
-    let mut to_delete_images = Vec::<(ImageId, Option<ImageKey>)>::new();
-
-    // possible performance bottleneck (duplicated cloning) !!
-    for (key, value) in app_resources.images.iter() {
-        match *value {
-            ImageState::ReadyForUpload(ref d) => {
-                updated_images.push((key.clone(), d.clone()));
-            },
-            ImageState::Uploaded(_) => { },
-            ImageState::AboutToBeDeleted((ref k, _)) => {
-                to_delete_images.push((key.clone(), k.clone()));
-            }
-        }
-    }
-
-    // Remove any images that should be deleted
-    for (resource_key, image_key) in to_delete_images.into_iter() {
-        if let Some(image_key) = image_key {
-            resource_updates.push(ResourceUpdate::DeleteImage(image_key));
-        }
-        app_resources.images.remove(&resource_key);
-    }
-
-    // Upload all remaining images to the GPU only if the haven't been
-    // uploaded yet
-    for (resource_key, (data, descriptor)) in updated_images.into_iter() {
-
-        let key = api.generate_image_key();
-        resource_updates.push(ResourceUpdate::AddImage(
-            AddImage { key, descriptor, data, tiling: None }
-        ));
-
-        *app_resources.images.get_mut(&resource_key).unwrap() =
-            ImageState::Uploaded(ImageInfo {
-                key: key,
-                descriptor: descriptor
-        });
-    }
-}
-
-// almost the same as update_image_resources, but fonts
-// have two HashMaps that need to be updated
-fn update_font_resources(
-    api: &RenderApi,
-    app_resources: &mut AppResources,
-    resource_updates: &mut Vec<ResourceUpdate>)
-{
-    use font::FontState;
-    use azul_css::FontId;
-
-    let mut updated_fonts = Vec::<(FontId, Vec<u8>)>::new();
-    let mut to_delete_fonts = Vec::<(FontId, Option<(FontKey, Vec<FontInstanceKey>)>)>::new();
-
-    for (key, value) in app_resources.font_data.borrow().iter() {
-        match &*(*value.2).borrow() {
-            FontState::ReadyForUpload(ref bytes) => {
-                updated_fonts.push((key.clone(), bytes.clone()));
-            },
-            FontState::Uploaded(_) => { },
-            FontState::AboutToBeDeleted(ref font_key) => {
-                let to_delete_font_instances = font_key.and_then(|f_key| {
-                    let to_delete_font_instances = app_resources.fonts[&f_key].values().cloned().collect();
-                    Some((f_key.clone(), to_delete_font_instances))
-                });
-                to_delete_fonts.push((key.clone(), to_delete_font_instances));
-            }
-        }
-    }
-
-    // Delete the complete font. Maybe a more granular option to
-    // keep the font data in memory should be added later
-    for (resource_key, to_delete_instances) in to_delete_fonts.into_iter() {
-        if let Some((font_key, font_instance_keys)) = to_delete_instances {
-            for instance in font_instance_keys {
-                resource_updates.push(ResourceUpdate::DeleteFontInstance(instance));
-            }
-            resource_updates.push(ResourceUpdate::DeleteFont(font_key));
-            app_resources.fonts.remove(&font_key);
-        }
-        app_resources.font_data.borrow_mut().remove(&resource_key);
-    }
-
-    // Upload all remaining fonts to the GPU only if the haven't been uploaded yet
-    for (resource_key, data) in updated_fonts.into_iter() {
-        let key = api.generate_font_key();
-        resource_updates.push(ResourceUpdate::AddFont(AddFont::Raw(key, data, 0))); // TODO: use the index better?
-        let mut borrow_mut = app_resources.font_data.borrow_mut();
-        *borrow_mut.get_mut(&resource_key).unwrap().2.borrow_mut() = FontState::Uploaded(key);
+        (builder, scrollable_nodes, layout_result)
     }
 }
 
@@ -377,7 +260,7 @@ struct ContentGroupOrder {
 fn determine_rendering_order<'a>(
     node_hierarchy: &NodeHierarchy,
     rectangles: &NodeDataContainer<DisplayRectangle<'a>>,
-    layouted_rects: &NodeDataContainer<LayoutRect>,
+    layouted_rects: &NodeDataContainer<PositionedRectangle>,
 ) -> ContentGroupOrder
 {
     let mut content_groups = Vec::new();
@@ -397,7 +280,7 @@ fn determine_rendering_order<'a>(
 fn determine_rendering_order_inner<'a>(
     node_hierarchy: &NodeHierarchy,
     rectangles: &NodeDataContainer<DisplayRectangle<'a>>,
-    layouted_rects: &NodeDataContainer<LayoutRect>,
+    layouted_rects: &NodeDataContainer<PositionedRectangle>,
     // recursive parameters
     root_depth: usize,
     root_id: NodeId,
@@ -409,7 +292,7 @@ fn determine_rendering_order_inner<'a>(
     let mut root_group = ContentGroup {
         root: RenderableNodeId {
             node_id: root_id,
-            clip_children: node_needs_to_clip_children(&rectangles[root_id].style),
+            clip_children: node_needs_to_clip_children(&rectangles[root_id].layout),
             scrolls_children: false, // TODO
         },
         root_depth,
@@ -460,7 +343,7 @@ fn determine_rendering_order_inner<'a>(
                         should_continue_loop = false;
                     } else {
                         // TODO: Overflow hidden in horizontal / vertical direction
-                        let node_is_overflow_hidden = node_needs_to_clip_children(&rect_node.style);
+                        let node_is_overflow_hidden = node_needs_to_clip_children(&rect_node.layout);
                         let node_needs_to_scroll_children = false; // TODO
                         root_group.node_ids.push(RenderableNodeId {
                             node_id,
@@ -491,115 +374,6 @@ fn determine_rendering_order_inner<'a>(
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct WordCache(BTreeMap<NodeId, (Words, FontMetrics)>);
-
-fn do_the_layout<'a,'b, T: Layout>(
-    node_hierarchy: &NodeHierarchy,
-    node_data: &NodeDataContainer<NodeData<T>>,
-    display_rects: &NodeDataContainer<DisplayRectangle<'a>>,
-    resource_updates: &mut Vec<ResourceUpdate>,
-    app_resources: &'b mut AppResources,
-    render_api: &RenderApi,
-    rect_size: LogicalSize,
-    rect_offset: LogicalPosition)
--> (NodeDataContainer<LayoutRect>, Vec<(usize, NodeId)>, WordCache)
-{
-    use text_layout::{split_text_into_words, get_words_cached};
-    use ui_solver::{solve_flex_layout_height, solve_flex_layout_width, get_x_positions, get_y_positions};
-
-    let word_cache: BTreeMap<NodeId, (Words, FontMetrics)> = node_hierarchy
-    .linear_iter()
-    .filter_map(|id| {
-        let (font, font_metrics, font_id, font_size) = match node_data[id].node_type {
-            NodeType::Label(_) | NodeType::Text(_) => {
-                use text_layout::TextLayoutOptions;
-
-                let rect = &display_rects[id];
-                let style = &rect.style;
-                let font_id = style.font_family.as_ref()?.fonts.get(0)?.clone();
-                let font_size = style.font_size.unwrap_or(*DEFAULT_FONT_SIZE);
-                let font_size_app_units = Au((font_size.0.to_pixels() as i32) * AU_PER_PX as i32);
-                let font_instance_key = push_font(&font_id, font_size_app_units, resource_updates, app_resources, render_api)?;
-                let overflow_behaviour = style.overflow.unwrap_or(LayoutOverflow::default());
-                let font = app_resources.get_font(&font_id)?;
-                let (horz_alignment, vert_alignment) = determine_text_alignment(rect);
-
-                let text_layout_options = TextLayoutOptions {
-                    horz_alignment,
-                    vert_alignment,
-                    line_height: style.line_height,
-                    letter_spacing: style.letter_spacing,
-                };
-                let font_metrics = FontMetrics::new(&font.0, &font_size, &text_layout_options);
-
-                (font.0, font_metrics, font_id, font_size)
-            },
-            _ => return None,
-        };
-
-        match &node_data[id].node_type {
-            NodeType::Label(ref string_to_render) => {
-                Some((id, (split_text_into_words(&string_to_render, &font, font_metrics.font_size_no_line_height, font_metrics.letter_spacing), font_metrics)))
-            },
-            NodeType::Text(text_id) => {
-                // Cloning the words here due to lifetime problems
-                Some((id, (get_words_cached(&text_id,
-                    &font,
-                    &font_id,
-                    &font_size.0,
-                    font_metrics.font_size_no_line_height,
-                    font_metrics.letter_spacing,
-                    &mut app_resources.text_cache).clone(), font_metrics)))
-            },
-            _ => None,
-        }
-    }).collect();
-
-    let preferred_widths = node_data.transform(|node, _| {
-        node.node_type.get_preferred_width(&app_resources.images)
-    });
-
-    let solved_widths = solve_flex_layout_width(
-        node_hierarchy,
-        &display_rects,
-        preferred_widths,
-        rect_size.width as f32,
-    );
-
-    let preferred_heights = node_data.transform(|node, id| {
-        use text_layout::TextSizePx;
-        node.node_type.get_preferred_height_based_on_width(
-            TextSizePx(solved_widths.solved_widths[id].total()),
-            &app_resources.images,
-            word_cache.get(&id).and_then(|e| Some(&e.0)),
-            word_cache.get(&id).and_then(|e| Some(e.1)),
-        ).and_then(|text_size| Some(text_size.0))
-    });
-
-    let solved_heights = solve_flex_layout_height(
-        node_hierarchy,
-        &solved_widths,
-        preferred_heights,
-        rect_size.height as f32,
-    );
-
-    let x_positions = get_x_positions(&solved_widths, node_hierarchy, rect_offset);
-    let y_positions = get_y_positions(&solved_heights, &solved_widths, node_hierarchy, rect_offset);
-
-    let layouted_arena = node_data.transform(|node, node_id| {
-        LayoutRect::new(
-            LayoutPoint::new(x_positions[node_id].0, y_positions[node_id].0),
-            LayoutSize::new(
-                solved_widths.solved_widths[node_id].total(),
-                solved_heights.solved_heights[node_id].total(),
-            )
-        )
-    });
-
-    (layouted_arena, solved_widths.non_leaf_nodes_sorted_by_depth, WordCache(word_cache))
-}
-
 #[derive(Default, Debug, Clone)]
 pub(crate)  struct ScrolledNodes {
     pub(crate) overflowing_nodes: BTreeMap<NodeId, OverflowingScrollNode>,
@@ -608,7 +382,7 @@ pub(crate)  struct ScrolledNodes {
 
 #[derive(Debug, Clone)]
 pub(crate) struct OverflowingScrollNode {
-    pub(crate) parent_rect: LayoutRect,
+    pub(crate) parent_rect: PositionedRectangle,
     pub(crate) child_rect: LayoutRect,
     pub(crate) parent_external_scroll_id: ExternalScrollId,
     pub(crate) parent_dom_hash: DomHash,
@@ -630,7 +404,7 @@ fn get_nodes_that_need_scroll_clip<'a, T: 'a + Layout>(
     node_hierarchy: &NodeHierarchy,
     display_list_rects: &NodeDataContainer<DisplayRectangle<'a>>,
     dom_rects: &NodeDataContainer<NodeData<T>>,
-    layouted_rects: &NodeDataContainer<LayoutRect>,
+    layouted_rects: &NodeDataContainer<PositionedRectangle>,
     parents: &[(usize, NodeId)],
     pipeline_id: PipelineId,
 ) -> ScrolledNodes {
@@ -644,7 +418,7 @@ fn get_nodes_that_need_scroll_clip<'a, T: 'a + Layout>(
 
         for child in parent.children(&node_hierarchy) {
             let old = children_sum_rect.unwrap_or(LayoutRect::zero());
-            children_sum_rect = Some(old.union(&layouted_rects[child]));
+            children_sum_rect = Some(old.union(&layouted_rects[child].bounds));
         }
 
         let children_sum_rect = match children_sum_rect {
@@ -652,9 +426,9 @@ fn get_nodes_that_need_scroll_clip<'a, T: 'a + Layout>(
             Some(sum) => sum,
         };
 
-        let parent_rect = &layouted_rects.get(*parent).unwrap();
+        let parent_rect = layouted_rects.get(*parent).unwrap();
 
-        if children_sum_rect.contains_rect(parent_rect) {
+        if children_sum_rect.contains_rect(&parent_rect.bounds) {
             continue;
         }
 
@@ -672,7 +446,7 @@ fn get_nodes_that_need_scroll_clip<'a, T: 'a + Layout>(
 
         tags_to_node_ids.insert(scroll_tag_id, *parent);
         nodes.insert(*parent, OverflowingScrollNode {
-            parent_rect: *parent_rect.clone(),
+            parent_rect: parent_rect.clone(),
             child_rect: children_sum_rect,
             parent_external_scroll_id,
             parent_dom_hash,
@@ -683,39 +457,43 @@ fn get_nodes_that_need_scroll_clip<'a, T: 'a + Layout>(
     ScrolledNodes { overflowing_nodes: nodes, tags_to_node_ids }
 }
 
-fn node_needs_to_clip_children(style: &RectStyle) -> bool {
-    let overflow = style.overflow.unwrap_or_default();
-    overflow.horizontal.clips_children() ||
-    overflow.vertical.clips_children()
+fn node_needs_to_clip_children(layout: &RectLayout) -> bool {
+    let overflow = layout.overflow.unwrap_or_default();
+    !overflow.is_horizontal_overflow_visible() ||
+    !overflow.is_vertical_overflow_visible()
 }
 
 #[test]
 fn test_overflow_parsing() {
-    use azul_css::{TextOverflowBehaviour, TextOverflowBehaviourInner};
-    let style1 = RectStyle::default();
-    assert!(!node_needs_to_clip_children(&style1));
 
-    let style2 = RectStyle {
+    use azul_css::Overflow;
+
+    let layout1 = RectLayout::default();
+
+    // The default for overflowing is overflow: auto, which clips
+    // children, so this should evaluate to true by default
+    assert_eq!(node_needs_to_clip_children(&layout1), true);
+
+    let layout2 = RectLayout {
         overflow: Some(LayoutOverflow {
-            horizontal: TextOverflowBehaviour::Modified(TextOverflowBehaviourInner::Visible),
-            vertical: TextOverflowBehaviour::Modified(TextOverflowBehaviourInner::Visible),
+            horizontal: Some(Overflow::Visible),
+            vertical: Some(Overflow::Visible),
         }),
         .. Default::default()
     };
-    assert!(!node_needs_to_clip_children(&style2));
+    assert_eq!(node_needs_to_clip_children(&layout2), false);
 
-    let style3 = RectStyle {
+    let layout3 = RectLayout {
         overflow: Some(LayoutOverflow {
-            horizontal: TextOverflowBehaviour::Modified(TextOverflowBehaviourInner::Hidden),
-            vertical: TextOverflowBehaviour::Modified(TextOverflowBehaviourInner::Visible),
+            horizontal: Some(Overflow::Hidden),
+            vertical: Some(Overflow::Visible),
         }),
         .. Default::default()
     };
-    assert!(node_needs_to_clip_children(&style3));
+    assert_eq!(node_needs_to_clip_children(&layout3), true);
 }
 
 fn push_rectangles_into_displaylist<'a, 'b, 'c, 'd, 'e, 'f, T: Layout>(
-    solved_rects: &NodeDataContainer<LayoutRect>,
     epoch: Epoch,
     window_size: WindowSize,
     content_grouped_rectangles: ContentGroupOrder,
@@ -724,11 +502,6 @@ fn push_rectangles_into_displaylist<'a, 'b, 'c, 'd, 'e, 'f, T: Layout>(
     referenced_content: &DisplayListParametersRef<'a,'b,'c,'d,'e, T>,
     referenced_mutable_content: &mut DisplayListParametersMut<'f, T>)
 {
-/* -- disabled scrolling temporarily due to z-indexing problems
-    // A stack containing all the nodes which have a scroll clip pushed to the builder.
-    let mut stack: Vec<NodeId> = vec![];
-*/
-
     let mut clip_stack = Vec::new();
 
     for content_group in content_grouped_rectangles.groups {
@@ -742,7 +515,6 @@ fn push_rectangles_into_displaylist<'a, 'b, 'c, 'd, 'e, 'f, T: Layout>(
         // Push the root of the node
         push_rectangles_into_displaylist_inner(
             content_group.root,
-            solved_rects,
             scrollable_nodes,
             &rectangle,
             referenced_content,
@@ -761,7 +533,6 @@ fn push_rectangles_into_displaylist<'a, 'b, 'c, 'd, 'e, 'f, T: Layout>(
 
             push_rectangles_into_displaylist_inner(
                 item,
-                solved_rects,
                 scrollable_nodes,
                 &rectangle,
                 referenced_content,
@@ -770,105 +541,33 @@ fn push_rectangles_into_displaylist<'a, 'b, 'c, 'd, 'e, 'f, T: Layout>(
             );
         }
     }
-/*
-    for (z_index, rects) in z_ordered_rectangles.0.into_iter() {
-        for rect_idx in rects {
-            let html_node = &arena[rect_idx];
-            let rectangle = DisplayListRectParams {
-                epoch,
-                rect_idx,
-                html_node: &html_node.node_type,
-            };
-
-            let styled_node = &referenced_content.display_rectangle_arena[rect_idx];
-            let solved_rect = solved_rects[rect_idx];
-
-            displaylist_handle_rect(solved_rect, scrollable_nodes, rectangle, referenced_content, referenced_mutable_content);
-/*
-            // If the current node is a parent that has overflow:hidden set, push
-            // the clip ID and the last child into the stack
-            if html_node.last_child.is_some() {
-                if node_needs_to_clip_children(&styled_node.style) {
-
-                }
-            }
-
-            // If the current node is the last child of the parent and the parent has
-            // overflow:hidden set, pop the last clip id
-            if clip_stack.last().cloned() == Some(rect_idx) {
-                referenced_mutable_content.builder.pop_clip_id();
-                clip_stack.pop();
-            }
-*/
-/* -- disabled scrolling temporarily due to z-indexing problems
-            if let Some(OverflowingScrollNode { parent_external_scroll_id, parent_rect, child_rect, .. }) = scrollable_nodes.overflowing_nodes.get(&rect_idx) {
-
-                // The unwraps on the following line must succeed, as if we have no children, we can't have a scrollable content.
-                stack.push(rect_idx.children(&arena).last().unwrap());
-
-                // Create a new scroll state for each node that is not present in the scroll states already.
-                // The arena containing the actual dom maps 1:1 to the arena containing the rectangles, so we
-                // can use the NodeIds from the layouted rectangles to access the NodeData corresponding
-                // to each Rectangle in the NodeData arena.
-                //
-                // This next unwrap is fine since we are sure the looked up NodeId exists in the arena!
-                scroll_states.ensure_initialized_scroll_state(
-                    *parent_external_scroll_id,
-                    child_rect.size.width - parent_rect.size.width,
-                    child_rect.size.height - parent_rect.size.height
-                );
-
-                // Set the scrolling clip
-                let clip_id = referenced_mutable_content.builder.define_scroll_frame(
-                    Some(*parent_external_scroll_id),
-                    *child_rect,
-                    *parent_rect,
-                    vec![],
-                    None,
-                    ScrollSensitivity::ScriptAndInputEvents,
-                );
-
-                referenced_mutable_content.builder.push_clip_id(clip_id);
-            }
-
-            if let Some(&child_idx) = stack.last() {
-                if child_idx == rect_idx {
-                    stack.pop();
-                    referenced_mutable_content.builder.pop_clip_id();
-                }
-            }
-*/
-        }
-    }
-*/
 }
 
 fn push_rectangles_into_displaylist_inner<'a,'b,'c,'d,'e,'f, T: Layout>(
     item: RenderableNodeId,
-    solved_rects_data: &NodeDataContainer<LayoutRect>,
     scrollable_nodes: &mut ScrolledNodes,
     rectangle: &DisplayListRectParams<'a, T>,
     referenced_content: &DisplayListParametersRef<'a,'b,'c,'d,'e, T>,
     referenced_mutable_content: &mut DisplayListParametersMut<'f, T>,
     clip_stack: &mut Vec<NodeId>,
 ) {
-    let solved_rect = solved_rects_data[rectangle.rect_idx];
-
     displaylist_handle_rect(
-        solved_rect,
         scrollable_nodes,
         rectangle,
         referenced_content,
         referenced_mutable_content
     );
+/*
+
+    // NOTE: table demo has problems with clipping
 
     if item.clip_children {
         if let Some(last_child) = referenced_content.node_hierarchy[rectangle.rect_idx].last_child {
             let styled_node = &referenced_content.display_rectangle_arena[rectangle.rect_idx];
-            let solved_rect = solved_rects_data[rectangle.rect_idx];
-            let clip = get_clip_region(solved_rect, &styled_node)
-                .unwrap_or(ComplexClipRegion::new(solved_rect, BorderRadius::zero(), ClipMode::Clip));
-            let clip_id = referenced_mutable_content.builder.define_clip(solved_rect, vec![clip], /* image_mask: */ None);
+            let solved_rect = &referenced_content.layout_result.rects[rectangle.rect_idx];
+            let clip = get_clip_region(solved_rect.bounds, &styled_node)
+                .unwrap_or(ComplexClipRegion::new(solved_rect.bounds, BorderRadius::zero(), ClipMode::Clip));
+            let clip_id = referenced_mutable_content.builder.define_clip(solved_rect.bounds, vec![clip], /* image_mask: */ None);
             referenced_mutable_content.builder.push_clip_id(clip_id);
             clip_stack.push(last_child);
         }
@@ -878,6 +577,7 @@ fn push_rectangles_into_displaylist_inner<'a,'b,'c,'d,'e,'f, T: Layout>(
         referenced_mutable_content.builder.pop_clip_id();
         clip_stack.pop();
     }
+*/
 }
 
 /// Parameters that apply to a single rectangle / div node
@@ -903,19 +603,15 @@ fn get_clip_region<'a>(bounds: LayoutRect, rect: &DisplayRectangle<'a>) -> Optio
 /// Push a single rectangle into the display list builder
 #[inline]
 fn displaylist_handle_rect<'a,'b,'c,'d,'e,'f,'g, T: Layout>(
-    bounds: LayoutRect,
     scrollable_nodes: &mut ScrolledNodes,
     rectangle: &DisplayListRectParams<'a, T>,
     referenced_content: &DisplayListParametersRef<'b,'c,'d,'e,'f, T>,
     referenced_mutable_content: &mut DisplayListParametersMut<'g, T>)
 {
-    use text_layout::{TextOverflow, TextSizePx};
-    use webrender::api::BorderRadius;
-
     let DisplayListParametersRef {
-        render_api, css,
-        display_rectangle_arena, word_cache, pipeline_id,
-        node_hierarchy, node_data,
+        css, display_rectangle_arena,
+        pipeline_id, node_hierarchy, node_data,
+        layout_result,
     } = referenced_content;
 
     let DisplayListRectParams {
@@ -923,6 +619,7 @@ fn displaylist_handle_rect<'a,'b,'c,'d,'e,'f,'g, T: Layout>(
     } = rectangle;
 
     let rect = &display_rectangle_arena[*rect_idx];
+    let bounds = layout_result.rects[*rect_idx].bounds;
 
     let info = LayoutPrimitiveInfo {
         rect: bounds,
@@ -953,25 +650,6 @@ fn displaylist_handle_rect<'a,'b,'c,'d,'e,'f,'g, T: Layout>(
 
     // If the rect is hit-testing relevant, we need to push a rect anyway.
     // Otherwise the hit-testing gets confused
-    if let Some(bg_col) = &rect.style.background_color {
-        // The background color won't be seen anyway, so don't push a
-        // background color if we do have a background already
-        if rect.style.background.is_none() {
-            push_rect(
-                &info,
-                referenced_mutable_content.builder,
-                bg_col,
-            );
-        }
-    } else if info.tag.is_some() {
-        const TRANSPARENT_BG: StyleBackgroundColor = StyleBackgroundColor(StyleColorU { r: 0, g: 0, b: 0, a: 0 });
-        push_rect(
-            &info,
-            referenced_mutable_content.builder,
-            &TRANSPARENT_BG,
-        );
-    }
-
     if let Some(bg) = &rect.style.background {
         push_background(
             &info,
@@ -981,6 +659,13 @@ fn displaylist_handle_rect<'a,'b,'c,'d,'e,'f,'g, T: Layout>(
             &rect.style.background_size,
             &rect.style.background_repeat,
             &referenced_mutable_content.app_resources,
+        );
+    } else if info.tag.is_some() {
+        const TRANSPARENT_BG: StyleColorU = StyleColorU { r: 0, g: 0, b: 0, a: 0 };
+        push_rect(
+            &info,
+            referenced_mutable_content.builder,
+            &TRANSPARENT_BG,
         );
     }
 
@@ -993,87 +678,29 @@ fn displaylist_handle_rect<'a,'b,'c,'d,'e,'f,'g, T: Layout>(
         );
     }
 
-    let (horz_alignment, vert_alignment) = determine_text_alignment(rect);
-
-    let scrollbar_style = ScrollbarInfo {
-        width: TextSizePx(17.0),
-        padding: TextSizePx(2.0),
-        background_color: StyleBackgroundColor(StyleColorU { r: 241, g: 241, b: 241, a: 255 }),
-        triangle_color: StyleBackgroundColor(StyleColorU { r: 163, g: 163, b: 163, a: 255 }),
-        bar_color: StyleBackgroundColor(StyleColorU { r: 193, g: 193, b: 193, a: 255 }),
-    };
-
-    // The only thing changed between TextId and String is
-    //`TextInfo::Cached` vs `TextInfo::Uncached` - reduce code duplication
-    let push_text_wrapper = |
-        text_info: &TextInfo,
-        builder: &mut DisplayListBuilder,
-        app_resources: &mut AppResources,
-        resource_updates: &mut Vec<ResourceUpdate>|
-    {
-        let words = word_cache.0.get(&rect_idx)?;
-
-        // Adjust the bounds by the padding
-        let mut text_bounds = rect.layout.padding
-            .as_ref()
-            .map(|padding| subtract_padding(&bounds, padding))
-            .unwrap_or(bounds);
-
-        text_bounds.size.width = text_bounds.size.width.max(0.0);
-        text_bounds.size.height = text_bounds.size.height.max(0.0);
-
-        let text_clip_region_id = rect.layout.padding.map(|_|
-            builder.define_clip(text_bounds, vec![ComplexClipRegion {
-                rect: text_bounds,
-                radii: BorderRadius::zero(),
-                mode: ClipMode::Clip,
-            }], None)
-        );
-
-        if let Some(text_clip_id) = text_clip_region_id {
-            builder.push_clip_id(text_clip_id);
-        }
-
-        let overflow = push_text(
-            &info,
-            text_info,
-            builder,
-            &rect.style,
-            app_resources,
-            &render_api,
-            &text_bounds,
-            resource_updates,
-            horz_alignment,
-            vert_alignment,
-            &scrollbar_style,
-            &words.0);
-
-        if text_clip_region_id.is_some() {
-            builder.pop_clip_id();
-        }
-
-        overflow
-    };
-
-    // Handle the special content of the node, return if it overflows in the vertical direction
-    let overflow_result = match html_node {
-        Div => { None },
-        Label(text) => push_text_wrapper(
-            &TextInfo::Uncached(text.clone()),
-            referenced_mutable_content.builder,
-            referenced_mutable_content.app_resources,
-            referenced_mutable_content.resource_updates),
-        Text(text_id) => push_text_wrapper(
-            &TextInfo::Cached(*text_id),
-            referenced_mutable_content.builder,
-            referenced_mutable_content.app_resources,
-            referenced_mutable_content.resource_updates),
+    match html_node {
+        Div => { },
+        Text(_) | Label(_) => {
+            // Text is laid out and positioned during the layout pass,
+            // so this should succeed - if there were problems
+            //
+            // TODO: In the table demo, the numbers don't show - empty glyphs (why?)!
+            push_text(
+                &info,
+                referenced_mutable_content.builder,
+                layout_result,
+                rect_idx,
+                &rect.style,
+                &rect.layout,
+            )
+        },
         Image(image_id) => push_image(
             &info,
             referenced_mutable_content.builder,
             referenced_mutable_content.app_resources,
             image_id,
-            info.rect.size),
+            LayoutSize::new(info.rect.size.width, info.rect.size.height)
+        ),
         GlTexture(callback) => push_opengl_texture(callback, &info, rectangle, referenced_content, referenced_mutable_content),
         IFrame(callback) => push_iframe(callback, &info, scrollable_nodes, rectangle, referenced_content, referenced_mutable_content),
     };
@@ -1083,22 +710,8 @@ fn displaylist_handle_rect<'a,'b,'c,'d,'e,'f,'g, T: Layout>(
         referenced_mutable_content.builder,
         &rect.style,
         &bounds,
-        BoxShadowClipMode::Inset);
-
-    // Push scrollbars if necessary
-    if let Some(overflow) = &overflow_result {
-        // If the rectangle should have a scrollbar, push a scrollbar onto the display list
-        if rect.style.overflow.unwrap_or_default().allows_vertical_scrollbar() {
-            if let TextOverflow::IsOverflowing(amount_vert) = overflow.text_overflow.vertical {
-                push_scrollbar(referenced_mutable_content.builder, &overflow.text_overflow, &scrollbar_style, &bounds, &rect.style.border)
-            }
-        }
-        if rect.style.overflow.unwrap_or_default().allows_horizontal_scrollbar() {
-            if let TextOverflow::IsOverflowing(amount_horz) = overflow.text_overflow.horizontal {
-                push_scrollbar(referenced_mutable_content.builder, &overflow.text_overflow, &scrollbar_style, &bounds, &rect.style.border)
-            }
-        }
-    }
+        BoxShadowClipMode::Inset
+    );
 
     if clip_region_id.is_some() {
         referenced_mutable_content.builder.pop_clip_id();
@@ -1111,12 +724,15 @@ fn push_opengl_texture<'a,'b,'c,'d,'e,'f, T: Layout>(
     rectangle: &DisplayListRectParams<'a, T>,
     referenced_content: &DisplayListParametersRef<'a,'b,'c,'d,'e, T>,
     referenced_mutable_content: &mut DisplayListParametersMut<'f, T>,
-) -> Option<OverflowInfo>
-{
+) {
     use compositor::{ActiveTexture, ACTIVE_GL_TEXTURES};
     use gleam::gl;
 
-    let bounds = HidpiAdjustedBounds::from_bounds(info.rect, rectangle.window_size.hidpi_factor, rectangle.window_size.winit_hidpi_factor);
+    let bounds = HidpiAdjustedBounds::from_bounds(
+        info.rect,
+        rectangle.window_size.hidpi_factor,
+        rectangle.window_size.winit_hidpi_factor
+    );
 
     let texture;
 
@@ -1133,20 +749,26 @@ fn push_opengl_texture<'a,'b,'c,'d,'e,'f, T: Layout>(
 
         gl_context.bind_framebuffer(gl::FRAMEBUFFER, 0);
         gl_context.disable(gl::FRAMEBUFFER_SRGB);
+        gl_context.disable(gl::MULTISAMPLE);
+        gl_context.viewport(0, 0, info.rect.size.width as i32, info.rect.size.height as i32);
     }
 
-    let texture = texture?;
+    let texture = match texture {
+        Some(s) => s,
+        None => return,
+    };
 
     let texture_width = texture.inner.width() as f32;
     let texture_height = texture.inner.height() as f32;
 
     let opaque = false;
+
+    // The texture gets mapped 1:1 onto the display, so there is no need for mipmaps
     let allow_mipmaps = false;
 
-    // Note: The ImageDescriptor has no effect
-    // on how large the image appears on-screen
+    // Note: The ImageDescriptor has no effect on how large the image appears on-screen
     let descriptor = ImageDescriptor::new(texture_width as i32, texture_height as i32, ImageFormat::BGRA8, opaque, allow_mipmaps);
-    let key = referenced_content.render_api.generate_image_key();
+    let key = referenced_mutable_content.app_resources.fake_display.render_api.generate_image_key();
     let external_image_id = ExternalImageId(new_opengl_texture_id() as u64);
 
     let data = ImageData::External(ExternalImageData {
@@ -1172,8 +794,6 @@ fn push_opengl_texture<'a,'b,'c,'d,'e,'f, T: Layout>(
         key,
         ColorF::WHITE
     );
-
-    None
 }
 
 fn push_iframe<'a,'b,'c,'d,'e,'f, T: Layout>(
@@ -1183,15 +803,14 @@ fn push_iframe<'a,'b,'c,'d,'e,'f, T: Layout>(
     rectangle: &DisplayListRectParams<'a, T>,
     referenced_content: &DisplayListParametersRef<'a,'b,'c,'d,'e, T>,
     referenced_mutable_content: &mut DisplayListParametersMut<'f, T>,
-) -> Option<OverflowInfo>
-{
-    use glium::glutin::dpi::{LogicalPosition, LogicalSize};
+) {
+    let bounds = HidpiAdjustedBounds::from_bounds(
+        info.rect,
+        rectangle.window_size.hidpi_factor,
+        rectangle.window_size.hidpi_factor
+    );
 
-    let bounds = HidpiAdjustedBounds::from_bounds(info.rect, rectangle.window_size.hidpi_factor, rectangle.window_size.hidpi_factor);
-
-    let new_dom;
-
-    {
+    let new_dom = {
         // Make sure that the app data is locked before invoking the callback
         let _lock = referenced_mutable_content.app_data.lock().unwrap();
 
@@ -1199,8 +818,9 @@ fn push_iframe<'a,'b,'c,'d,'e,'f, T: Layout>(
             window: referenced_mutable_content.fake_window,
             resources: &referenced_mutable_content.app_resources,
         };
-        new_dom = (iframe_callback.0)(&iframe_pointer, window_info, bounds);
-    }
+
+        (iframe_callback.0)(&iframe_pointer, window_info, bounds)
+    };
 
     // TODO: Right now, no focusing, hovering or :active allowed in iframes!
     let is_mouse_down = false;
@@ -1219,45 +839,46 @@ fn push_iframe<'a,'b,'c,'d,'e,'f, T: Layout>(
     );
 
     let display_list = DisplayList::new_from_ui_description(&ui_description, &ui_state);
+    referenced_mutable_content.app_resources.add_fonts_and_images(&display_list);
 
-    let arena = ui_description.ui_descr_arena.borrow();
+    let arena = &ui_description.ui_descr_arena;
     let node_hierarchy = &arena.node_layout;
     let node_data = &arena.node_data;
 
     // Insert the DOM into the solver so we can solve the layout of the rectangles
-    let rect_size = LogicalSize::new(
-        info.rect.size.width as f64 / rectangle.window_size.hidpi_factor * rectangle.window_size.winit_hidpi_factor,
-        info.rect.size.height as f64 / rectangle.window_size.hidpi_factor * rectangle.window_size.winit_hidpi_factor,
+    let rect_size = LayoutSize::new(
+        info.rect.size.width / rectangle.window_size.hidpi_factor as f32 * rectangle.window_size.winit_hidpi_factor as f32,
+        info.rect.size.height / rectangle.window_size.hidpi_factor as f32 * rectangle.window_size.winit_hidpi_factor as f32,
     );
-    let rect_origin = LogicalPosition::new(info.rect.origin.x as f64, info.rect.origin.y as f64);
-
-    let (laid_out_rectangles, node_depths, word_cache) = do_the_layout(
+    let rect_origin = LayoutPoint::new(info.rect.origin.x, info.rect.origin.y);
+    let layout_result = do_the_layout(
         &node_hierarchy,
         &node_data,
         &display_list.rectangles,
-        &mut referenced_mutable_content.resource_updates,
-        &mut referenced_mutable_content.app_resources,
-        &referenced_content.render_api,
+        &*referenced_mutable_content.app_resources,
         rect_size,
-        rect_origin);
+        rect_origin,
+    );
 
     let mut scrollable_nodes = get_nodes_that_need_scroll_clip(
-        node_hierarchy, &display_list.rectangles, node_data, &laid_out_rectangles,
-        &node_depths, referenced_content.pipeline_id);
+        node_hierarchy, &display_list.rectangles, node_data, &layout_result.rects,
+        &layout_result.node_depths, referenced_content.pipeline_id
+    );
 
-    let rects_in_rendering_order = determine_rendering_order(node_hierarchy, &display_list.rectangles, &laid_out_rectangles);
+    let rects_in_rendering_order = determine_rendering_order(
+        node_hierarchy, &display_list.rectangles, &layout_result.rects
+    );
 
     let referenced_content = DisplayListParametersRef {
         // Important: Need to update the ui description, otherwise this function would be endlessly recursive
         node_hierarchy,
         node_data,
         display_rectangle_arena: &display_list.rectangles,
-        word_cache: &word_cache,
+        layout_result: &layout_result,
         .. *referenced_content
     };
 
     push_rectangles_into_displaylist(
-        &laid_out_rectangles,
         rectangle.epoch,
         rectangle.window_size,
         rects_in_rendering_order,
@@ -1269,8 +890,6 @@ fn push_iframe<'a,'b,'c,'d,'e,'f, T: Layout>(
 
     parent_scrollable_nodes.overflowing_nodes.extend(scrollable_nodes.overflowing_nodes.into_iter());
     parent_scrollable_nodes.tags_to_node_ids.extend(scrollable_nodes.tags_to_node_ids.into_iter());
-
-    None
 }
 
 /// Since the display list can take a lot of parameters, we don't want to
@@ -1281,18 +900,15 @@ fn push_iframe<'a,'b,'c,'d,'e,'f, T: Layout>(
 ///  **immutable references** to other things that need to be passed down the display list
 #[derive(Copy, Clone)]
 struct DisplayListParametersRef<'a, 'b, 'c, 'd, 'e, T: 'a + Layout> {
-    pub pipeline_id: PipelineId,
-    pub node_hierarchy: &'e NodeHierarchy,
     pub node_data: &'a NodeDataContainer<NodeData<T>>,
     /// The CSS that should be applied to the DOM
     pub css: &'b Css,
-    /// Necessary to push
-    pub render_api: &'c RenderApi,
+    /// Laid out words and rectangles (contains info about content bounds and text layout)
+    pub layout_result: &'c LayoutResult,
     /// Reference to the arena that contains all the styled rectangles
     pub display_rectangle_arena: &'d NodeDataContainer<DisplayRectangle<'d>>,
-    /// Reference to the word cache (left over from the layout,
-    /// to re-use the text layout from there)
-    pub word_cache: &'c WordCache,
+    pub node_hierarchy: &'e NodeHierarchy,
+    pub pipeline_id: PipelineId,
 }
 
 /// Same as `DisplayListParametersRef`, but for `&mut Something`
@@ -1315,238 +931,118 @@ struct DisplayListParametersMut<'a, T: 'a + Layout> {
     pub pipeline_id: PipelineId,
 }
 
-#[inline]
 fn push_rect(
     info: &PrimitiveInfo<LayoutPixel>,
     builder: &mut DisplayListBuilder,
-    color: &StyleBackgroundColor)
-{
+    color: &StyleColorU
+) {
     use css::webrender_translate::wr_translate_color_u;
-    builder.push_rect(&info, wr_translate_color_u(color.0).into());
+    builder.push_rect(&info, wr_translate_color_u(*color).into());
 }
 
-struct OverflowInfo {
-    pub text_overflow: TextOverflowPass2,
-}
-
-/// Note: automatically pushes the scrollbars on the parent,
-/// this should be refined later
-#[inline]
 fn push_text(
     info: &PrimitiveInfo<LayoutPixel>,
-    text: &TextInfo,
     builder: &mut DisplayListBuilder,
-    style: &RectStyle,
-    app_resources: &mut AppResources,
-    render_api: &RenderApi,
-    bounds: &TypedRect<f32, LayoutPixel>,
-    resource_updates: &mut Vec<ResourceUpdate>,
-    horz_alignment: StyleTextAlignmentHorz,
-    vert_alignment: StyleTextAlignmentVert,
-    scrollbar_info: &ScrollbarInfo,
-    words: &Words)
--> Option<OverflowInfo>
-{
-    use text_layout::{self, TextLayoutOptions};
+    layout_result: &LayoutResult,
+    node_id: &NodeId,
+    rect_style: &RectStyle,
+    rect_layout: &RectLayout,
+) {
+    use text_layout::get_layouted_glyphs;
     use css::webrender_translate::wr_translate_color_u;
+    use ui_solver::determine_text_alignment;
 
-    if text.is_empty_text(&*app_resources) {
-        return None;
-    }
-
-    let font_id = style.font_family.as_ref()?.fonts.get(0)?.clone();
-    let font_size = style.font_size.unwrap_or(*DEFAULT_FONT_SIZE);
-    let font_size_app_units = Au((font_size.0.to_pixels() as i32) * AU_PER_PX as i32);
-    let font_instance_key = push_font(&font_id, font_size_app_units, resource_updates, app_resources, render_api)?;
-    let overflow_behaviour = style.overflow.unwrap_or_default();
-
-    let text_layout_options = TextLayoutOptions {
-        horz_alignment,
-        vert_alignment,
-        line_height: style.line_height,
-        letter_spacing: style.letter_spacing,
+    let (scaled_words, _font_instance_key) = match layout_result.scaled_words.get(node_id) {
+        Some(s) => s,
+        None => return,
     };
 
-    let (positioned_glyphs, text_overflow) = text_layout::get_glyphs(
-        words,
-        app_resources,
-        bounds,
-        &font_id,
-        &font_size,
-        &text_layout_options,
-        text,
-        &overflow_behaviour,
-        scrollbar_info
+    let (word_positions, font_instance_key) = match layout_result.positioned_word_cache.get(node_id) {
+        Some(s) => s,
+        None => return,
+    };
+
+    let (horz_alignment, vert_alignment) = determine_text_alignment(rect_style, rect_layout);
+
+    let rect_padding_top = rect_layout.padding.unwrap_or_default().top.map(|top| top.to_pixels()).unwrap_or(0.0);
+    let rect_padding_left = rect_layout.padding.unwrap_or_default().left.map(|left| left.to_pixels()).unwrap_or(0.0);
+    let rect_offset = LayoutPoint::new(info.rect.origin.x + rect_padding_left, info.rect.origin.y + rect_padding_top);
+    let bounding_size_height_px = info.rect.size.height - rect_layout.get_vertical_padding();
+
+    let layouted_glyphs = get_layouted_glyphs(
+        word_positions,
+        scaled_words,
+        horz_alignment,
+        vert_alignment,
+        rect_offset.clone(),
+        bounding_size_height_px
     );
+
+    let font_color = rect_style.font_color.unwrap_or(DEFAULT_FONT_COLOR).0;
+    let font_color = wr_translate_color_u(font_color);
 
     // WARNING: Do not enable FontInstanceFlags::FONT_SMOOTHING or FontInstanceFlags::FORCE_AUTOHINT -
     // they seem to interfere with the text layout thereby messing with the actual text layout.
-    let font_color = wr_translate_color_u(style.font_color.unwrap_or(DEFAULT_FONT_COLOR).0).into();
     let mut flags = FontInstanceFlags::empty();
     flags.set(FontInstanceFlags::SUBPIXEL_BGR, true);
+    flags.set(FontInstanceFlags::NO_AUTOHINT, true);
     flags.set(FontInstanceFlags::LCD_VERTICAL, true);
 
-    let options = GlyphOptions {
-        render_mode: FontRenderMode::Subpixel,
-        flags: flags,
+    let overflow_horizontal_visible = rect_layout.is_horizontal_overflow_visible();
+    let overflow_vertical_visible = rect_layout.is_horizontal_overflow_visible();
+
+    let max_bounds = builder.content_size();
+    let current_bounds = info.rect;
+    let original_text_bounds = rect_layout.padding
+        .as_ref()
+        .map(|padding| subtract_padding(&current_bounds, padding))
+        .unwrap_or(current_bounds);
+
+    // Adjust the bounds by the padding, depending on the overflow:visible parameter
+    let mut text_bounds = match (overflow_horizontal_visible, overflow_vertical_visible) {
+        (true, true) => None,
+        (false, false) => Some(original_text_bounds),
+        (true, false) => {
+            // Horizontally visible, vertically cut
+            Some(LayoutRect::new(rect_offset, LayoutSize::new(max_bounds.width, original_text_bounds.size.height)))
+        },
+        (false, true) => {
+            // Vertically visible, horizontally cut
+            Some(LayoutRect::new(rect_offset, LayoutSize::new(original_text_bounds.size.width, max_bounds.height)))
+        },
     };
 
-    builder.push_text(&info, &positioned_glyphs, font_instance_key, font_color, Some(options));
-
-    Some(OverflowInfo { text_overflow })
-}
-
-/// Adds a scrollbar to the left or bottom side of a rectangle.
-/// TODO: make styling configurable (like the width / style of the scrollbar)
-fn push_scrollbar(
-    builder: &mut DisplayListBuilder,
-    scrollbar_info: &TextOverflowPass2,
-    scrollbar_style: &ScrollbarInfo,
-    bounds: &TypedRect<f32, LayoutPixel>,
-    border: &Option<StyleBorder>)
-{
-    use euclid::TypedPoint2D;
-
-    // The border is inside the rectangle - subtract the border width on the left and bottom side,
-    // so that the scrollbar is laid out correctly
-    let mut bounds = *bounds;
-    if let Some(StyleBorder { left: Some(l), bottom: Some(b), .. }) = border {
-        bounds.size.width -= l.border_width.to_pixels();
-        bounds.size.height -= b.border_width.to_pixels();
+    if let Some(text_bounds) = &mut text_bounds {
+        text_bounds.size.width = text_bounds.size.width.max(0.0);
+        text_bounds.size.height = text_bounds.size.height.max(0.0);
+        let clip_id = builder.define_clip(*text_bounds, vec![ComplexClipRegion {
+            rect: *text_bounds,
+            radii: BorderRadius::zero(),
+            mode: ClipMode::Clip,
+        }], None);
+        builder.push_clip_id(clip_id);
     }
 
-    // Background of scrollbar (vertical)
-    let scrollbar_vertical_background = TypedRect::<f32, LayoutPixel> {
-        origin: TypedPoint2D::new(bounds.origin.x + bounds.size.width - scrollbar_style.width.0, bounds.origin.y),
-        size: TypedSize2D::new(scrollbar_style.width.0, bounds.size.height),
-    };
+    builder.push_text(
+        &info,
+        &layouted_glyphs.glyphs,
+        *font_instance_key,
+        font_color.into(),
+        Some(GlyphOptions {
+            render_mode: FontRenderMode::Subpixel,
+            flags: flags,
+        })
+    );
 
-    let scrollbar_vertical_background_info = PrimitiveInfo {
-        rect: scrollbar_vertical_background,
-        clip_rect: bounds,
-        is_backface_visible: false,
-        tag: None, // TODO: for hit testing
-    };
-
-    push_rect(&scrollbar_vertical_background_info, builder, &scrollbar_style.background_color);
-
-    // Actual scroll bar
-    let scrollbar_vertical_bar = TypedRect::<f32, LayoutPixel> {
-        origin: TypedPoint2D::new(
-            bounds.origin.x + bounds.size.width - scrollbar_style.width.0 + scrollbar_style.padding.0,
-            bounds.origin.y + scrollbar_style.width.0),
-        size: TypedSize2D::new(
-            scrollbar_style.width.0 - (scrollbar_style.padding.0 * 2.0),
-            bounds.size.height - (scrollbar_style.width.0 * 2.0)),
-    };
-
-    let scrollbar_vertical_bar_info = PrimitiveInfo {
-        rect: scrollbar_vertical_bar,
-        clip_rect: bounds,
-        is_backface_visible: false,
-        tag: None, // TODO: for hit testing
-    };
-
-    push_rect(&scrollbar_vertical_bar_info, builder, &scrollbar_style.bar_color);
-
-    // Triangle top
-    let mut scrollbar_triangle_rect = TypedRect::<f32, LayoutPixel> {
-        origin: TypedPoint2D::new(
-            bounds.origin.x + bounds.size.width - scrollbar_style.width.0 + scrollbar_style.padding.0,
-            bounds.origin.y + scrollbar_style.padding.0),
-        size: TypedSize2D::new(
-            scrollbar_style.width.0 - (scrollbar_style.padding.0 * 2.0),
-            scrollbar_style.width.0 - (scrollbar_style.padding.0 * 2.0)),
-    };
-
-    scrollbar_triangle_rect.origin.x += scrollbar_triangle_rect.size.width / 4.0;
-    scrollbar_triangle_rect.origin.y += scrollbar_triangle_rect.size.height / 4.0;
-    scrollbar_triangle_rect.size.width /= 2.0;
-    scrollbar_triangle_rect.size.height /= 2.0;
-
-    push_triangle(&scrollbar_triangle_rect, builder, &scrollbar_style.triangle_color, TriangleDirection::PointUp);
-
-    // Triangle bottom
-    scrollbar_triangle_rect.origin.y += bounds.size.height - scrollbar_style.width.0 + scrollbar_style.padding.0;
-    push_triangle(&scrollbar_triangle_rect, builder, &scrollbar_style.triangle_color, TriangleDirection::PointDown);
+    if text_bounds.is_some() {
+        builder.pop_clip_id();
+    }
 }
 
-enum TriangleDirection {
-    PointUp,
-    PointDown,
-    PointRight,
-    PointLeft,
-}
-
-fn push_triangle(
-    bounds: &TypedRect<f32, LayoutPixel>,
-    builder: &mut DisplayListBuilder,
-    background_color: &StyleBackgroundColor,
-    direction: TriangleDirection)
-{
-    use self::TriangleDirection::*;
-    use webrender::api::{LayoutSideOffsets, BorderRadius};
-    use css::webrender_translate::wr_translate_color_u;
-
-    // see: https://css-tricks.com/snippets/css/css-triangle/
-    // uses the "3d effect" for making a triangle
-
-    let triangle_rect_info = PrimitiveInfo {
-        rect: *bounds,
-        clip_rect: *bounds,
-        is_backface_visible: false,
-        tag: None,
-    };
-
-    const TRANSPARENT: ColorU = ColorU { r: 0, b: 0, g: 0, a: 0 };
-
-    // make all borders but one transparent
-    let [b_left, b_right, b_top, b_bottom] = match direction {
-        PointUp         => [
-            (TRANSPARENT, BorderStyle::Hidden),
-            (TRANSPARENT, BorderStyle::Hidden),
-            (TRANSPARENT, BorderStyle::Hidden),
-            (wr_translate_color_u(background_color.0), BorderStyle::Solid)
-        ],
-        PointDown       => [
-            (TRANSPARENT, BorderStyle::Hidden),
-            (TRANSPARENT, BorderStyle::Hidden),
-            (wr_translate_color_u(background_color.0), BorderStyle::Solid),
-            (TRANSPARENT, BorderStyle::Hidden)
-        ],
-        PointLeft       => [
-            (TRANSPARENT, BorderStyle::Hidden),
-            (wr_translate_color_u(background_color.0), BorderStyle::Solid),
-            (TRANSPARENT, BorderStyle::Hidden),
-            (TRANSPARENT, BorderStyle::Hidden)
-        ],
-        PointRight      => [
-            (wr_translate_color_u(background_color.0), BorderStyle::Solid),
-            (TRANSPARENT, BorderStyle::Hidden),
-            (TRANSPARENT, BorderStyle::Hidden),
-            (TRANSPARENT, BorderStyle::Hidden)
-        ],
-    };
-
-    let border_details = BorderDetails::Normal(NormalBorder {
-        left:   BorderSide { color: b_left.0.into(),         style: b_left.1   },
-        right:  BorderSide { color: b_right.0.into(),        style: b_right.1  },
-        top:    BorderSide { color: b_top.0.into(),          style: b_top.1    },
-        bottom: BorderSide { color: b_bottom.0.into(),       style: b_bottom.1 },
-        radius: BorderRadius::zero(),
-        do_aa: true,
-    });
-
-    // make the borders half the width / height of the rectangle,
-    // so that the border looks like a triangle
-    let left = bounds.size.width / 2.0;
-    let top = bounds.size.height / 2.0;
-    let bottom = top;
-    let right = left;
-
-    let border_widths = LayoutSideOffsets::new(top, right, bottom, left);
-
-    builder.push_border(&triangle_rect_info, border_widths, border_details);
+enum ShouldPushShadow {
+    OneShadow,
+    TwoShadows,
+    AllShadows,
 }
 
 /// WARNING: For "inset" shadows, you must push a clip ID first, otherwise the
@@ -1561,156 +1057,7 @@ fn push_box_shadow(
     bounds: &LayoutRect,
     shadow_type: BoxShadowClipMode)
 {
-    fn push_box_shadow_inner(
-        builder: &mut DisplayListBuilder,
-        pre_shadow: &Option<BoxShadowPreDisplayItem>,
-        border_radius: StyleBorderRadius,
-        bounds: &LayoutRect,
-        clip_rect: LayoutRect,
-        shadow_type: BoxShadowClipMode)
-    {
-        use webrender::api::LayoutVector2D;
-        use css::webrender_translate::{
-            wr_translate_color_u, wr_translate_border_radius,
-            wr_translate_box_shadow_clip_mode
-        };
-
-        let pre_shadow = match pre_shadow {
-            None => return,
-            Some(ref s) => s,
-        };
-
-        // The pre_shadow is missing the StyleBorderRadius & LayoutRect
-        if pre_shadow.clip_mode != shadow_type {
-            return;
-        }
-
-        let full_screen_rect = LayoutRect::new(LayoutPoint::zero(), builder.content_size());;
-
-        // prevent shadows that are larger than the full screen
-        let clip_rect = clip_rect.intersection(&full_screen_rect).unwrap_or(clip_rect);
-
-        // Apply a gamma of 2.2 to the original value
-        //
-        // NOTE: strangely box-shadow is the only thing that needs to be gamma-corrected...
-        fn apply_gamma(color: ColorF) -> ColorF {
-
-            const GAMMA: f32 = 2.2;
-            const GAMMA_F: f32 = 1.0 / GAMMA;
-
-            ColorF {
-                r: color.r.powf(GAMMA_F),
-                g: color.g.powf(GAMMA_F),
-                b: color.b.powf(GAMMA_F),
-                a: color.a,
-            }
-        }
-
-        let info = LayoutPrimitiveInfo::with_clip_rect(LayoutRect::zero(), clip_rect);
-        builder.push_box_shadow(
-            &info,
-            *bounds,
-            LayoutVector2D::new(pre_shadow.offset[0].to_pixels(), pre_shadow.offset[1].to_pixels()),
-            apply_gamma(wr_translate_color_u(pre_shadow.color).into()),
-            pre_shadow.blur_radius.to_pixels(),
-            pre_shadow.spread_radius.to_pixels(),
-            wr_translate_border_radius(border_radius.0).into(),
-            wr_translate_box_shadow_clip_mode(pre_shadow.clip_mode)
-        );
-    }
-
-    fn get_clip_rect(pre_shadow: &BoxShadowPreDisplayItem, bounds: &LayoutRect) -> LayoutRect {
-        if pre_shadow.clip_mode == BoxShadowClipMode::Inset {
-            // inset shadows do not work like outset shadows
-            // for inset shadows, you have to push a clip ID first, so that they are
-            // clipped to the bounds -we trust that the calling function knows to do this
-            *bounds
-        } else {
-            // calculate the maximum extent of the outset shadow
-            let mut clip_rect = *bounds;
-
-            let origin_displace = (pre_shadow.spread_radius.to_pixels() + pre_shadow.blur_radius.to_pixels()) * 2.0;
-            clip_rect.origin.x = clip_rect.origin.x - pre_shadow.offset[0].to_pixels() - origin_displace;
-            clip_rect.origin.y = clip_rect.origin.y - pre_shadow.offset[1].to_pixels() - origin_displace;
-
-            clip_rect.size.height = clip_rect.size.height + (origin_displace * 2.0);
-            clip_rect.size.width = clip_rect.size.width + (origin_displace * 2.0);
-            clip_rect
-        }
-    }
-
-    fn push_single_box_shadow_edge(
-            builder: &mut DisplayListBuilder,
-            current_shadow: &BoxShadowPreDisplayItem,
-            bounds: &LayoutRect,
-            border_radius: StyleBorderRadius,
-            shadow_type: BoxShadowClipMode,
-            top: &Option<Option<BoxShadowPreDisplayItem>>,
-            bottom: &Option<Option<BoxShadowPreDisplayItem>>,
-            left: &Option<Option<BoxShadowPreDisplayItem>>,
-            right: &Option<Option<BoxShadowPreDisplayItem>>,
-    ) {
-        let is_inset_shadow = current_shadow.clip_mode == BoxShadowClipMode::Inset;
-        let origin_displace = (current_shadow.spread_radius.to_pixels() + current_shadow.blur_radius.to_pixels()) * 2.0;
-
-        let mut shadow_bounds = *bounds;
-        let mut clip_rect = *bounds;
-
-        if is_inset_shadow {
-            // If the shadow is inset, we adjust the clip rect to be
-            // exactly the amount of the shadow
-            if let Some(Some(top)) = top {
-                clip_rect.size.height = origin_displace;
-                shadow_bounds.size.width += origin_displace;
-                shadow_bounds.origin.x -= origin_displace / 2.0;
-            } else if let Some(Some(bottom)) = bottom {
-                clip_rect.size.height = origin_displace;
-                clip_rect.origin.y += bounds.size.height - origin_displace;
-                shadow_bounds.size.width += origin_displace;
-                shadow_bounds.origin.x -= origin_displace / 2.0;
-            } else if let Some(Some(left)) = left {
-                clip_rect.size.width = origin_displace;
-                shadow_bounds.size.height += origin_displace;
-                shadow_bounds.origin.y -= origin_displace / 2.0;
-            } else if let Some(Some(right)) = right {
-                clip_rect.size.width = origin_displace;
-                clip_rect.origin.x += bounds.size.width - origin_displace;
-                shadow_bounds.size.height += origin_displace;
-                shadow_bounds.origin.y -= origin_displace / 2.0;
-            }
-        } else {
-            if let Some(Some(top)) = top {
-                clip_rect.size.height = origin_displace;
-                clip_rect.origin.y -= origin_displace;
-                shadow_bounds.size.width += origin_displace;
-                shadow_bounds.origin.x -= origin_displace / 2.0;
-            } else if let Some(Some(bottom)) = bottom {
-                clip_rect.size.height = origin_displace;
-                clip_rect.origin.y += bounds.size.height;
-                shadow_bounds.size.width += origin_displace;
-                shadow_bounds.origin.x -= origin_displace / 2.0;
-            } else if let Some(Some(left)) = left {
-                clip_rect.size.width = origin_displace;
-                clip_rect.origin.x -= origin_displace;
-                shadow_bounds.size.height += origin_displace;
-                shadow_bounds.origin.y -= origin_displace / 2.0;
-            } else if let Some(Some(right)) = right {
-                clip_rect.size.width = origin_displace;
-                clip_rect.origin.x += bounds.size.width;
-                shadow_bounds.size.height += origin_displace;
-                shadow_bounds.origin.y -= origin_displace / 2.0;
-            }
-        }
-
-        push_box_shadow_inner(
-            builder,
-            &Some(*current_shadow),
-            border_radius,
-            &shadow_bounds,
-            clip_rect,
-            shadow_type
-        );
-    }
+    use self::ShouldPushShadow::*;
 
     // Box-shadow can be applied to each corner separately. This means, in practice
     // that we simply overlay multiple shadows with shifted clipping rectangles
@@ -1718,23 +1065,18 @@ fn push_box_shadow(
         Some(s) => s,
         None => return,
     };
+
     let border_radius = style.border_radius.unwrap_or(StyleBorderRadius::zero());
 
-    enum ShouldPushShadow {
-        PushOneShadow,
-        PushTwoShadows,
-        PushAllShadows,
-    }
-
     let what_shadow_to_push = match [top, left, bottom, right].iter().filter(|x| x.is_some()).count() {
-        1 => ShouldPushShadow::PushOneShadow,
-        2 => ShouldPushShadow::PushTwoShadows,
-        4 => ShouldPushShadow::PushAllShadows,
+        1 => OneShadow,
+        2 => TwoShadows,
+        4 => AllShadows,
         _ => return,
     };
 
     match what_shadow_to_push {
-        ShouldPushShadow::PushOneShadow => {
+        OneShadow => {
             let current_shadow = match (top, left, bottom, right) {
                  | (Some(Some(shadow)), None, None, None)
                  | (None, Some(Some(shadow)), None, None)
@@ -1753,7 +1095,7 @@ fn push_box_shadow(
         //
         // box-shadow-top: 0px 0px 5px red;
         // box-shadow-bottom: 0px 0px 5px blue;
-        ShouldPushShadow::PushTwoShadows => {
+        TwoShadows => {
             match (top, left, bottom, right) {
 
                 // top + bottom box-shadow pair
@@ -1781,7 +1123,7 @@ fn push_box_shadow(
                 _ => return, // reachable, but invalid
             }
         },
-        ShouldPushShadow::PushAllShadows => {
+        AllShadows => {
 
             // Assumes that all box shadows are the same, so just use the top shadow
             let top_shadow = top.unwrap();
@@ -1800,6 +1142,158 @@ fn push_box_shadow(
             );
         }
     }
+}
+
+fn push_box_shadow_inner(
+    builder: &mut DisplayListBuilder,
+    pre_shadow: &Option<BoxShadowPreDisplayItem>,
+    border_radius: StyleBorderRadius,
+    bounds: &LayoutRect,
+    clip_rect: LayoutRect,
+    shadow_type: BoxShadowClipMode)
+{
+    use webrender::api::LayoutVector2D;
+    use css::webrender_translate::{
+        wr_translate_color_u, wr_translate_border_radius,
+        wr_translate_box_shadow_clip_mode
+    };
+
+    let pre_shadow = match pre_shadow {
+        None => return,
+        Some(ref s) => s,
+    };
+
+    // The pre_shadow is missing the StyleBorderRadius & LayoutRect
+    if pre_shadow.clip_mode != shadow_type {
+        return;
+    }
+
+    let full_screen_rect = LayoutRect::new(LayoutPoint::zero(), builder.content_size());;
+
+    // prevent shadows that are larger than the full screen
+    let clip_rect = clip_rect.intersection(&full_screen_rect).unwrap_or(clip_rect);
+
+    // Apply a gamma of 2.2 to the original value
+    //
+    // NOTE: strangely box-shadow is the only thing that needs to be gamma-corrected...
+    fn apply_gamma(color: ColorF) -> ColorF {
+
+        const GAMMA: f32 = 2.2;
+        const GAMMA_F: f32 = 1.0 / GAMMA;
+
+        ColorF {
+            r: color.r.powf(GAMMA_F),
+            g: color.g.powf(GAMMA_F),
+            b: color.b.powf(GAMMA_F),
+            a: color.a,
+        }
+    }
+
+    let info = LayoutPrimitiveInfo::with_clip_rect(LayoutRect::zero(), clip_rect);
+    builder.push_box_shadow(
+        &info,
+        *bounds,
+        LayoutVector2D::new(pre_shadow.offset[0].to_pixels(), pre_shadow.offset[1].to_pixels()),
+        apply_gamma(wr_translate_color_u(pre_shadow.color).into()),
+        pre_shadow.blur_radius.to_pixels(),
+        pre_shadow.spread_radius.to_pixels(),
+        wr_translate_border_radius(border_radius.0).into(),
+        wr_translate_box_shadow_clip_mode(pre_shadow.clip_mode)
+    );
+}
+
+fn get_clip_rect(pre_shadow: &BoxShadowPreDisplayItem, bounds: &LayoutRect) -> LayoutRect {
+    if pre_shadow.clip_mode == BoxShadowClipMode::Inset {
+        // inset shadows do not work like outset shadows
+        // for inset shadows, you have to push a clip ID first, so that they are
+        // clipped to the bounds -we trust that the calling function knows to do this
+        *bounds
+    } else {
+        // calculate the maximum extent of the outset shadow
+        let mut clip_rect = *bounds;
+
+        let origin_displace = (pre_shadow.spread_radius.to_pixels() + pre_shadow.blur_radius.to_pixels()) * 2.0;
+        clip_rect.origin.x = clip_rect.origin.x - pre_shadow.offset[0].to_pixels() - origin_displace;
+        clip_rect.origin.y = clip_rect.origin.y - pre_shadow.offset[1].to_pixels() - origin_displace;
+
+        clip_rect.size.height = clip_rect.size.height + (origin_displace * 2.0);
+        clip_rect.size.width = clip_rect.size.width + (origin_displace * 2.0);
+        clip_rect
+    }
+}
+
+#[allow(clippy::collapsible_if)]
+fn push_single_box_shadow_edge(
+        builder: &mut DisplayListBuilder,
+        current_shadow: &BoxShadowPreDisplayItem,
+        bounds: &LayoutRect,
+        border_radius: StyleBorderRadius,
+        shadow_type: BoxShadowClipMode,
+        top: &Option<Option<BoxShadowPreDisplayItem>>,
+        bottom: &Option<Option<BoxShadowPreDisplayItem>>,
+        left: &Option<Option<BoxShadowPreDisplayItem>>,
+        right: &Option<Option<BoxShadowPreDisplayItem>>,
+) {
+    let is_inset_shadow = current_shadow.clip_mode == BoxShadowClipMode::Inset;
+    let origin_displace = (current_shadow.spread_radius.to_pixels() + current_shadow.blur_radius.to_pixels()) * 2.0;
+
+    let mut shadow_bounds = *bounds;
+    let mut clip_rect = *bounds;
+
+    if is_inset_shadow {
+        // If the shadow is inset, we adjust the clip rect to be
+        // exactly the amount of the shadow
+        if let Some(Some(top)) = top {
+            clip_rect.size.height = origin_displace;
+            shadow_bounds.size.width += origin_displace;
+            shadow_bounds.origin.x -= origin_displace / 2.0;
+        } else if let Some(Some(bottom)) = bottom {
+            clip_rect.size.height = origin_displace;
+            clip_rect.origin.y += bounds.size.height - origin_displace;
+            shadow_bounds.size.width += origin_displace;
+            shadow_bounds.origin.x -= origin_displace / 2.0;
+        } else if let Some(Some(left)) = left {
+            clip_rect.size.width = origin_displace;
+            shadow_bounds.size.height += origin_displace;
+            shadow_bounds.origin.y -= origin_displace / 2.0;
+        } else if let Some(Some(right)) = right {
+            clip_rect.size.width = origin_displace;
+            clip_rect.origin.x += bounds.size.width - origin_displace;
+            shadow_bounds.size.height += origin_displace;
+            shadow_bounds.origin.y -= origin_displace / 2.0;
+        }
+    } else {
+        if let Some(Some(top)) = top {
+            clip_rect.size.height = origin_displace;
+            clip_rect.origin.y -= origin_displace;
+            shadow_bounds.size.width += origin_displace;
+            shadow_bounds.origin.x -= origin_displace / 2.0;
+        } else if let Some(Some(bottom)) = bottom {
+            clip_rect.size.height = origin_displace;
+            clip_rect.origin.y += bounds.size.height;
+            shadow_bounds.size.width += origin_displace;
+            shadow_bounds.origin.x -= origin_displace / 2.0;
+        } else if let Some(Some(left)) = left {
+            clip_rect.size.width = origin_displace;
+            clip_rect.origin.x -= origin_displace;
+            shadow_bounds.size.height += origin_displace;
+            shadow_bounds.origin.y -= origin_displace / 2.0;
+        } else if let Some(Some(right)) = right {
+            clip_rect.size.width = origin_displace;
+            clip_rect.origin.x += bounds.size.width;
+            shadow_bounds.size.height += origin_displace;
+            shadow_bounds.origin.y -= origin_displace / 2.0;
+        }
+    }
+
+    push_box_shadow_inner(
+        builder,
+        &Some(*current_shadow),
+        border_radius,
+        &shadow_bounds,
+        clip_rect,
+        shadow_type
+    );
 }
 
 #[inline]
@@ -1860,21 +1354,26 @@ fn push_background(
         },
         Image(style_image_id) => {
             // TODO: background-origin, background-position, background-repeat
-            if let Some(image_id) = app_resources.css_ids_to_image_ids.get(&style_image_id.0) {
+            if let Some(image_id) = app_resources.get_css_image_id(&style_image_id.0) {
 
                 let bounds = info.rect;
-                let image_dimensions = app_resources.images.get(image_id).and_then(|i| Some(i.get_dimensions()))
-                    .unwrap_or((bounds.size.width, bounds.size.height)); // better than crashing...
+                let image_dimensions = app_resources.get_image_info(image_id)
+                    .map(|info| (info.descriptor.size.width, info.descriptor.size.height))
+                    .unwrap_or((bounds.size.width as i32, bounds.size.height as i32)); // better than crashing...
 
                 let size = match background_size {
                     Some(bg_size) => calculate_background_size(bg_size, &info, &image_dimensions),
-                    None => TypedSize2D::new(image_dimensions.0, image_dimensions.1)
+                    None => TypedSize2D::new(image_dimensions.0 as f32, image_dimensions.1 as f32),
                 };
 
                 let background_repeat = background_repeat.unwrap_or_default();
                 let background_repeat_info = get_background_repeat_info(&info, background_repeat, size);
+
                 push_image(&background_repeat_info, builder, app_resources, image_id, size);
             }
+        },
+        Color(c) => {
+            push_rect(&info, builder, c);
         },
         NoBackground => { },
     }
@@ -1920,12 +1419,12 @@ struct Ratio {
 fn calculate_background_size(
     bg_size: &StyleBackgroundSize,
     info: &PrimitiveInfo<LayoutPixel>,
-    image_dimensions: &(f32, f32)
+    image_dimensions: &(i32, i32)
 ) -> TypedSize2D<f32, LayoutPixel> {
 
     let original_ratios = Ratio {
-        width: info.rect.size.width / image_dimensions.0,
-        height: info.rect.size.height / image_dimensions.1
+        width: info.rect.size.width / image_dimensions.0 as f32,
+        height: info.rect.size.height / image_dimensions.1 as f32,
     };
 
     let ratio = match bg_size {
@@ -1933,7 +1432,7 @@ fn calculate_background_size(
         StyleBackgroundSize::Cover => original_ratios.width.max(original_ratios.height)
     };
 
-    TypedSize2D::new(image_dimensions.0 * ratio, image_dimensions.1 * ratio)
+    TypedSize2D::new(image_dimensions.0 as f32 * ratio, image_dimensions.1 as f32 * ratio)
 }
 
 #[inline]
@@ -1942,12 +1441,9 @@ fn push_image(
     builder: &mut DisplayListBuilder,
     app_resources: &AppResources,
     image_id: &ImageId,
-    size: TypedSize2D<f32, LayoutPixel>)
--> Option<OverflowInfo>
-{
-    use images::ImageState::*;
-
-    if let Uploaded(image_info) = app_resources.images.get(image_id)? {
+    size: TypedSize2D<f32, LayoutPixel>
+) {
+    if let Some(image_info) = app_resources.get_image_info(image_id) {
         builder.push_image(
             info,
             size,
@@ -1958,9 +1454,6 @@ fn push_image(
             ColorF::WHITE,
         );
     }
-
-    // TODO: determine if the image has overflown its container
-    None
 }
 
 #[inline]
@@ -1982,106 +1475,16 @@ fn push_border(
     }
 }
 
-#[inline]
-fn push_font(
-    font_id: &FontId,
-    font_size_app_units: Au,
-    resource_updates: &mut Vec<ResourceUpdate>,
-    app_resources: &mut AppResources,
-    render_api: &RenderApi)
--> Option<FontInstanceKey>
-{
-    use font::FontState;
-
-    if font_size_app_units < MIN_AU || font_size_app_units > MAX_AU {
-        #[cfg(feature = "logging")] {
-            error!("warning: too big or too small font size");
-        }
-        return None;
-    }
-
-    let font_state = app_resources.get_font_state(font_id)?;
-
-    let borrow = font_state.borrow();
-
-    match &*borrow {
-        FontState::Uploaded(font_key) => {
-            let font_sizes_hashmap = app_resources.fonts.entry(*font_key)
-                                     .or_insert(FastHashMap::default());
-            let font_instance_key = font_sizes_hashmap.entry(font_size_app_units)
-                .or_insert_with(|| {
-                    let f_instance_key = render_api.generate_font_instance_key();
-                    resource_updates.push(ResourceUpdate::AddFontInstance(
-                        AddFontInstance {
-                            key: f_instance_key,
-                            font_key: *font_key,
-                            glyph_size: font_size_app_units,
-                            options: None,
-                            platform_options: None,
-                            variations: Vec::new(),
-                        }
-                    ));
-                    f_instance_key
-                }
-            );
-
-            Some(*font_instance_key)
-        },
-        _ => {
-            // This can happen when the font is loaded for the first time in `.get_font_state`
-            // TODO: Make a pre-pass that queries and uploads all non-available fonts
-            // error!("warning: trying to use font {:?} that isn't yet available", font_id);
-            None
-        },
-    }
-}
-
-/// For a given rectangle, determines what text alignment should be used
-fn determine_text_alignment<'a>(rect: &DisplayRectangle<'a>)
--> (StyleTextAlignmentHorz, StyleTextAlignmentVert)
-{
-    let mut horz_alignment = StyleTextAlignmentHorz::default();
-    let mut vert_alignment = StyleTextAlignmentVert::default();
-
-    if let Some(align_items) = rect.layout.align_items {
-        // Vertical text alignment
-        use azul_css::LayoutAlignItems;
-        match align_items {
-            LayoutAlignItems::Start => vert_alignment = StyleTextAlignmentVert::Top,
-            LayoutAlignItems::End => vert_alignment = StyleTextAlignmentVert::Bottom,
-            // technically stretch = blocktext, but we don't have that yet
-            _ => vert_alignment = StyleTextAlignmentVert::Center,
-        }
-    }
-
-    if let Some(justify_content) = rect.layout.justify_content {
-        use azul_css::LayoutJustifyContent;
-        // Horizontal text alignment
-        match justify_content {
-            LayoutJustifyContent::Start => horz_alignment = StyleTextAlignmentHorz::Left,
-            LayoutJustifyContent::End => horz_alignment = StyleTextAlignmentHorz::Right,
-            _ => horz_alignment = StyleTextAlignmentHorz::Center,
-        }
-    }
-
-    if let Some(text_align) = rect.style.text_align {
-        // Horizontal text alignment with higher priority
-        horz_alignment = text_align;
-    }
-
-    (horz_alignment, vert_alignment)
-}
-
 /// Subtracts the padding from the bounds, returning the new bounds
 ///
 /// Warning: The resulting rectangle may have negative width or height
 fn subtract_padding(bounds: &TypedRect<f32, LayoutPixel>, padding: &LayoutPadding)
 -> TypedRect<f32, LayoutPixel>
 {
-    let top     = padding.top.and_then(|top| Some(top.to_pixels())).unwrap_or(0.0);
-    let bottom  = padding.bottom.and_then(|bottom| Some(bottom.to_pixels())).unwrap_or(0.0);
-    let left    = padding.left.and_then(|left| Some(left.to_pixels())).unwrap_or(0.0);
-    let right   = padding.right.and_then(|right| Some(right.to_pixels())).unwrap_or(0.0);
+    let top     = padding.top.map(|top| top.to_pixels()).unwrap_or(0.0);
+    let bottom  = padding.bottom.map(|bottom| bottom.to_pixels()).unwrap_or(0.0);
+    let left    = padding.left.map(|left| left.to_pixels()).unwrap_or(0.0);
+    let right   = padding.right.map(|right| right.to_pixels()).unwrap_or(0.0);
 
     let mut new_bounds = *bounds;
 
@@ -2093,77 +1496,23 @@ fn subtract_padding(bounds: &TypedRect<f32, LayoutPixel>, padding: &LayoutPaddin
     new_bounds
 }
 
-/// Populate the style properties of the `DisplayRectangle`
+/// Populate the style properties of the `DisplayRectangle`, apply static / dynamic properties
 fn populate_css_properties(
     rect: &mut DisplayRectangle,
     node_id: NodeId,
-    css_overrides: &BTreeMap<NodeId, FastHashMap<String, CssProperty>>)
-{
-    use azul_css::CssProperty::{self, *};
+    css_overrides: &BTreeMap<NodeId, FastHashMap<DomString, CssProperty>>
+) {
+    use azul_css::CssDeclaration::*;
 
-    fn apply_style_property(rect: &mut DisplayRectangle, property: &CssProperty) {
-        match property {
-            BorderRadius(b)     => { rect.style.border_radius = Some(*b);                   },
-            BackgroundColor(c)  => { rect.style.background_color = Some(*c);                },
-            BackgroundSize(s)   => { rect.style.background_size = Some(*s);                 },
-            BackgroundRepeat(r) => { rect.style.background_repeat = Some(*r);               },
-            TextColor(t)        => { rect.style.font_color = Some(*t);                      },
-            Border(b)           => { StyleBorder::merge(&mut rect.style.border, &b);        },
-            Background(b)       => { rect.style.background = Some(b.clone());               },
-            FontSize(f)         => { rect.style.font_size = Some(*f);                       },
-            FontFamily(f)       => { rect.style.font_family = Some(f.clone());              },
-            LetterSpacing(l)    => { rect.style.letter_spacing = Some(*l);                  },
-            Overflow(o)         => { LayoutOverflow::merge(&mut rect.style.overflow, &o);   },
-            TextAlign(ta)       => { rect.style.text_align = Some(*ta);                     },
-            BoxShadow(b)        => { StyleBoxShadow::merge(&mut rect.style.box_shadow, b);  },
-            LineHeight(lh)      => { rect.style.line_height = Some(*lh);                    },
-
-            Width(w)            => { rect.layout.width = Some(*w);                          },
-            Height(h)           => { rect.layout.height = Some(*h);                         },
-            MinWidth(mw)        => { rect.layout.min_width = Some(*mw);                     },
-            MinHeight(mh)       => { rect.layout.min_height = Some(*mh);                    },
-            MaxWidth(mw)        => { rect.layout.max_width = Some(*mw);                     },
-            MaxHeight(mh)       => { rect.layout.max_height = Some(*mh);                    },
-
-            Position(p)         => { rect.layout.position = Some(*p);                       },
-            Top(t)              => { rect.layout.top = Some(*t);                            },
-            Bottom(b)           => { rect.layout.bottom = Some(*b);                         },
-            Right(r)            => { rect.layout.right = Some(*r);                          },
-            Left(l)             => { rect.layout.left = Some(*l);                           },
-
-            Padding(p)          => { LayoutPadding::merge(&mut rect.layout.padding, &p);    },
-            Margin(m)           => { LayoutMargin::merge(&mut rect.layout.margin, &m);      },
-
-            FlexGrow(g)         => { rect.layout.flex_grow = Some(*g)                       },
-            FlexShrink(s)       => { rect.layout.flex_shrink = Some(*s)                     },
-            FlexWrap(w)         => { rect.layout.wrap = Some(*w);                           },
-            FlexDirection(d)    => { rect.layout.direction = Some(*d);                      },
-            JustifyContent(j)   => { rect.layout.justify_content = Some(*j);                },
-            AlignItems(a)       => { rect.layout.align_items = Some(*a);                    },
-            AlignContent(a)     => { rect.layout.align_content = Some(*a);                  },
-            Cursor(_)           => { /* cursor neither affects layout nor styling */        },
-        }
-    }
-
-    use azul_css::DynamicCssPropertyDefault;
-
-    // Assert that the types of two properties matches
-    fn property_type_matches(a: &CssProperty, b: &DynamicCssPropertyDefault) -> bool {
-        use std::mem::discriminant;
-        use azul_css::DynamicCssPropertyDefault::*;
-        match b {
-            Exact(e) => discriminant(a) == discriminant(e),
-            Auto => true, // "auto" always matches
-        }
-    }
-
-    // Apply / static / dynamic properties
-    for constraint in &rect.styled_node.css_constraints {
-        use azul_css::CssDeclaration::*;
-        match constraint {
+    for constraint in rect.styled_node.css_constraints.values() {
+        match &constraint {
             Static(static_property) => apply_style_property(rect, static_property),
             Dynamic(dynamic_property) => {
-                if let Some(overridden_property) = css_overrides.get(&node_id).and_then(|overrides| overrides.get(&dynamic_property.dynamic_id)) {
+                let is_dynamic_prop = css_overrides.get(&node_id).and_then(|overrides| {
+                    overrides.get(&DomString::Heap(dynamic_property.dynamic_id.clone()))
+                });
+
+                if let Some(overridden_property) = is_dynamic_prop {
                     // Only apply the dynamic style property default, if it isn't set to auto
                     if property_type_matches(overridden_property, &dynamic_property.default) {
                         apply_style_property(rect, overridden_property);
@@ -2181,5 +1530,63 @@ fn populate_css_properties(
                 }
             }
         }
+    }
+}
+
+// Assert that the types of two properties matches
+fn property_type_matches(a: &CssProperty, b: &DynamicCssPropertyDefault) -> bool {
+    use std::mem::discriminant;
+    use azul_css::DynamicCssPropertyDefault::*;
+    match b {
+        Exact(e) => discriminant(a) == discriminant(e),
+        Auto => true, // "auto" always matches
+    }
+}
+
+fn apply_style_property(rect: &mut DisplayRectangle, property: &CssProperty) {
+
+    use azul_css::CssProperty::*;
+
+    match property {
+        BorderRadius(b)     => { rect.style.border_radius = Some(*b);                   },
+        BackgroundSize(s)   => { rect.style.background_size = Some(*s);                 },
+        BackgroundRepeat(r) => { rect.style.background_repeat = Some(*r);               },
+        TextColor(t)        => { rect.style.font_color = Some(*t);                      },
+        Border(b)           => { StyleBorder::merge(&mut rect.style.border, &b);        },
+        Background(b)       => { rect.style.background = Some(b.clone());               },
+        FontSize(f)         => { rect.style.font_size = Some(*f);                       },
+        FontFamily(f)       => { rect.style.font_family = Some(f.clone());              },
+        LetterSpacing(l)    => { rect.style.letter_spacing = Some(*l);                  },
+        TextAlign(ta)       => { rect.style.text_align = Some(*ta);                     },
+        BoxShadow(b)        => { StyleBoxShadow::merge(&mut rect.style.box_shadow, b);  },
+        LineHeight(lh)      => { rect.style.line_height = Some(*lh);                    },
+
+        Width(w)            => { rect.layout.width = Some(*w);                          },
+        Height(h)           => { rect.layout.height = Some(*h);                         },
+        MinWidth(mw)        => { rect.layout.min_width = Some(*mw);                     },
+        MinHeight(mh)       => { rect.layout.min_height = Some(*mh);                    },
+        MaxWidth(mw)        => { rect.layout.max_width = Some(*mw);                     },
+        MaxHeight(mh)       => { rect.layout.max_height = Some(*mh);                    },
+
+        Position(p)         => { rect.layout.position = Some(*p);                       },
+        Top(t)              => { rect.layout.top = Some(*t);                            },
+        Bottom(b)           => { rect.layout.bottom = Some(*b);                         },
+        Right(r)            => { rect.layout.right = Some(*r);                          },
+        Left(l)             => { rect.layout.left = Some(*l);                           },
+
+        Padding(p)          => { LayoutPadding::merge(&mut rect.layout.padding, &p);    },
+        Margin(m)           => { LayoutMargin::merge(&mut rect.layout.margin, &m);      },
+        Overflow(o)         => { LayoutOverflow::merge(&mut rect.layout.overflow, &o);  },
+        WordSpacing(ws)     => { rect.style.word_spacing = Some(*ws);                   },
+        TabWidth(tw)        => { rect.style.tab_width = Some(*tw);                      },
+
+        FlexGrow(g)         => { rect.layout.flex_grow = Some(*g)                       },
+        FlexShrink(s)       => { rect.layout.flex_shrink = Some(*s)                     },
+        FlexWrap(w)         => { rect.layout.wrap = Some(*w);                           },
+        FlexDirection(d)    => { rect.layout.direction = Some(*d);                      },
+        JustifyContent(j)   => { rect.layout.justify_content = Some(*j);                },
+        AlignItems(a)       => { rect.layout.align_items = Some(*a);                    },
+        AlignContent(a)     => { rect.layout.align_content = Some(*a);                  },
+        Cursor(_)           => { /* cursor neither affects layout nor styling */        },
     }
 }

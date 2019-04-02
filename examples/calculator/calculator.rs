@@ -4,7 +4,10 @@ extern crate azul;
 
 use azul::prelude::*;
 
-const FONT: &[u8] = include_bytes!("../assets/fonts/KoHo-Light.ttf");
+macro_rules! CSS_PATH {() => { concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/calculator/calculator.css")};}
+macro_rules! FONT_PATH {() => { concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/fonts/KoHo-Light.ttf")};}
+
+const FONT: &[u8] = include_bytes!(FONT_PATH!());
 
 #[derive(Clone, Debug)]
 enum Event {
@@ -31,14 +34,14 @@ struct Calculator {
 
 impl Layout for Calculator {
     fn layout(&self, _info: LayoutInfo<Self>) -> Dom<Self> {
-        fn numpad_btn(label: &str, class: &str) -> Dom<Calculator> {
+        fn numpad_btn(label: &'static str, class: &'static str) -> Dom<Calculator> {
             Dom::label(label)
                 .with_class(class)
                 .with_tab_index(TabIndex::Auto)
                 .with_callback(On::MouseUp, Callback(handle_mouseclick_numpad_btn))
         }
 
-        fn render_row(labels: &[&str; 4]) -> Dom<Calculator> {
+        fn render_row(labels: &[&'static str; 4]) -> Dom<Calculator> {
             Dom::div()
                 .with_class("row")
                 .with_child(numpad_btn(labels[0], "numpad-button"))
@@ -390,15 +393,13 @@ fn perform_operation(left_operand: f32, operation: &Event, right_operand: f32) -
 }
 
 fn main() {
-    macro_rules! CSS_PATH {
-        () => {
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/calculator.css")
-        };
-    }
 
-    let mut app = App::new(Calculator::default(), AppConfig::default());
-    app.add_font(FontId::ExternalFont("KoHo-Light".into()), FONT).unwrap();
     let css = css::override_native(include_str!(CSS_PATH!())).unwrap();
-    let window = Window::new(WindowCreateOptions::default(), css).unwrap();
+
+    let mut app = App::new(Calculator::default(), AppConfig::default()).unwrap();
+    let font_id = app.add_css_font_id("KoHo-Light");
+    app.add_font(font_id, FontSource::Embedded(FONT));
+
+    let window = app.create_window(WindowCreateOptions::default(), css.clone()).unwrap();
     app.run(window).unwrap();
 }

@@ -4,16 +4,15 @@ use std::sync::atomic::{Ordering, AtomicBool};
 
 pub(crate) static SHOULD_ENABLE_PANIC_HOOK: AtomicBool = AtomicBool::new(false);
 
-pub(crate) fn set_up_logging(log_file_path: Option<String>, log_level: LevelFilter) {
+pub(crate) fn set_up_logging(log_file_path: Option<&str>, log_level: LevelFilter) {
 
     use fern::InitError;
     use std::error::Error;
 
     /// Sets up the global logger
-    fn set_up_logging_internal(log_file_path: Option<String>, log_level: LevelFilter)
+    fn set_up_logging_internal(log_file_path: Option<&str>, log_level: LevelFilter)
     -> Result<(), InitError>
     {
-
         use std::io::{Error as IoError, ErrorKind as IoErrorKind};
         use fern::{Dispatch, log_file};
 
@@ -25,7 +24,7 @@ pub(crate) fn set_up_logging(log_file_path: Option<String>, log_level: LevelFilt
                 "Executable has no executable path (?), can't open log file")))?;
 
             exe_location.pop();
-            exe_location.push(log_file_path.unwrap_or(String::from("error.log")));
+            exe_location.push(log_file_path.unwrap_or("error.log"));
             exe_location
         };
 
@@ -50,11 +49,11 @@ pub(crate) fn set_up_logging(log_file_path: Option<String>, log_level: LevelFilt
         Err(e) => match e {
             InitError::Io(e) => {
                 println!("[WARN] Logging IO init error: \r\nkind: {:?}\r\n\r\ndescription:\r\n{}\r\n\r\ncause:\r\n{:?}\r\n",
-                           e.kind(), e.description(), e.cause());
+                           e.kind(), e.description(), e.source());
             },
             InitError::SetLoggerError(e) => {
                 println!("[WARN] Logging initalization error: \r\ndescription:\r\n{}\r\n\r\ncause:\r\n{:?}\r\n",
-                    e.description(), e.cause());
+                    e.description(), e.source());
             }
         }
     }
@@ -76,14 +75,14 @@ pub(crate) fn set_up_panic_hooks() {
 
         let payload_str = format!("{:?}", payload);
         let panic_str = payload.downcast_ref::<String>()
-                .and_then(|s| Some(s.as_ref()))
+                .map(|s| s.as_ref())
                 .or_else(||
                     payload.downcast_ref::<&str>()
-                    .and_then(|s| Some(*s))
+                    .map(|s| *s)
                 )
                 .unwrap_or(payload_str.as_str());
 
-        let location_str = location.and_then(|loc| Some(format!("{} at line {}", loc.file(), loc.line())));
+        let location_str = location.map(|loc| format!("{} at line {}", loc.file(), loc.line()));
         let backtrace_str_old = format_backtrace(&Backtrace::new());
         let backtrace_str = backtrace_str_old
             .lines()

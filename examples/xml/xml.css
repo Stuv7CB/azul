@@ -2,7 +2,7 @@
     color: white;
     background-color: #222;
     font-size: 16px;
-    letter-spacing: 0.5px;
+    border: 1px solid green;
 }
 
 #start_screen {
@@ -10,7 +10,6 @@
 }
 
 #new_project_btn {
-    background-color: blue;
     color: white;
     border-radius: 4px;
     background: linear-gradient(to right, #da4453, #89216b);
@@ -23,17 +22,17 @@
 }
 
 #new_project_btn:active {
-    background-color: red;
+    background-color: blue;
 }
 
 #project_btn_container {
     flex-direction: row;
     height: 70px;
-    padding: 10px;
 }
 
 #last_projects_column {
     max-width: 300px;
+    margin: 10px;
 }
 
 #map_preview_container {
@@ -42,8 +41,4 @@
 
 #map_preview {
     background: linear-gradient(300deg, #03001e, #7303c0, #ec38bc, #fdeff9);
-}
-
-#last_projects_header {
-    line-height: 1.5;
 }

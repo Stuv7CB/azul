@@ -5,7 +5,9 @@ extern crate azul;
 use azul::{prelude::*, widgets::button::Button};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/game_of_life.css"));
+macro_rules! CSS_PATH {() => { concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/game_of_life/game_of_life.css")};}
+
+const CSS: &str = include_str!(CSS_PATH!());
 const INITIAL_UNIVERSE_WIDTH: usize = 75;
 const INITIAL_UNIVERSE_HEIGHT: usize = 75;
 
@@ -30,11 +32,13 @@ impl Cell {
     pub fn is_alive(&self) -> bool { *self == Cell::Alive }
 }
 
+#[derive(Debug, PartialEq, Clone)]
 struct Universe {
     board: Board,
     game_is_running: bool,
 }
 
+#[derive(Debug, PartialEq, Clone)]
 struct Board {
     vertical_cells: usize,
     horizontal_cells: usize,
@@ -116,30 +120,35 @@ impl Board {
 }
 
 // Update the cell state
-fn tick(state: &mut Universe, _: &mut AppResources) -> (UpdateScreen, TerminateDaemon) {
+fn tick(state: &mut Universe, _: &mut AppResources) -> (UpdateScreen, TerminateTimer) {
+    state.board = next_iteration(&state.board);
+    (Redraw, TerminateTimer::Continue)
+}
 
-    let mut new_cells = state.board.cells.clone();
+fn next_iteration(input: &Board) -> Board {
 
-    for (row_idx, row) in new_cells.iter_mut().enumerate() {
+    let mut new_board = input.clone();
 
-        let upper_r = if row_idx == 0 { state.board.vertical_cells - 1 } else { row_idx - 1 };
-        let lower_r = if row_idx == state.board.vertical_cells - 1 { 0 } else { row_idx + 1 };
+    for (row_idx, row) in new_board.cells.iter_mut().enumerate() {
+
+        let upper_r = if row_idx == 0 { input.vertical_cells - 1 } else { row_idx - 1 };
+        let lower_r = if row_idx == input.vertical_cells - 1 { 0 } else { row_idx + 1 };
 
         for (cell_idx, cell) in row.iter_mut().enumerate() {
 
             // Select all neighbours of the current cell (the 8 cells surrounding the current cell)
-            let left_c = if cell_idx == 0 { state.board.horizontal_cells - 1 } else { cell_idx - 1 };
-            let right_c = if cell_idx == state.board.horizontal_cells - 1 { 0 } else { cell_idx + 1 };
+            let left_c = if cell_idx == 0 { input.horizontal_cells - 1 } else { cell_idx - 1 };
+            let right_c = if cell_idx == input.horizontal_cells - 1 { 0 } else { cell_idx + 1 };
 
             let neighbors = [
-                &state.board.cells[upper_r][left_c],
-                &state.board.cells[upper_r][cell_idx],
-                &state.board.cells[upper_r][right_c],
-                &state.board.cells[row_idx][left_c],
-                &state.board.cells[row_idx][right_c],
-                &state.board.cells[lower_r][left_c],
-                &state.board.cells[lower_r][cell_idx],
-                &state.board.cells[lower_r][right_c]
+                &input.cells[upper_r][left_c],
+                &input.cells[upper_r][cell_idx],
+                &input.cells[upper_r][right_c],
+                &input.cells[row_idx][left_c],
+                &input.cells[row_idx][right_c],
+                &input.cells[lower_r][left_c],
+                &input.cells[lower_r][cell_idx],
+                &input.cells[lower_r][right_c]
             ];
 
             let alive_neighbors = neighbors.iter().filter(|c| c.is_alive()).count();
@@ -152,9 +161,7 @@ fn tick(state: &mut Universe, _: &mut AppResources) -> (UpdateScreen, TerminateD
         }
     }
 
-    state.board.cells = new_cells;
-
-    (Redraw, TerminateDaemon::Continue)
+    new_board
 }
 
 /// Callback that starts the main
@@ -162,18 +169,20 @@ fn start_stop_game(app_state: &mut AppState<Universe>, _: &mut CallbackInfo<Univ
 
     use std::time::Duration;
 
-    if let Some(daemon) = {
+    if let Some(timer) = {
         let state = &mut app_state.data.lock().ok()?;
         state.board = Board::new_random(INITIAL_UNIVERSE_WIDTH, INITIAL_UNIVERSE_HEIGHT);
 
         if state.game_is_running {
             None
         } else {
+            let timer = Timer::new(tick).with_interval(Duration::from_millis(200));
+
             state.game_is_running = true;
-            Some(Daemon::new(tick).with_interval(Duration::from_millis(200)))
+            Some(timer)
         }
     }{
-        app_state.add_daemon(DaemonId::new(), daemon);
+        app_state.add_timer(TimerId::new(), timer);
     }
 
     Redraw
@@ -181,15 +190,15 @@ fn start_stop_game(app_state: &mut AppState<Universe>, _: &mut CallbackInfo<Univ
 
 fn main() {
 
-    let app = App::new(Universe {
+    let mut app = App::new(Universe {
         board: Board::empty(INITIAL_UNIVERSE_WIDTH, INITIAL_UNIVERSE_HEIGHT),
         game_is_running: false,
-    }, AppConfig::default());
+    }, AppConfig::default()).unwrap();
 
     let mut window_options = WindowCreateOptions::default();
     window_options.state.title = "Game of Life".into();
 
     let css = css::override_native(CSS).unwrap();
-    let window = Window::new(window_options, css).unwrap();
+    let window = app.create_window(window_options, css).unwrap();
     app.run(window).unwrap();
 }

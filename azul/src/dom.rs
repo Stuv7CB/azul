@@ -1,27 +1,23 @@
 use std::{
     fmt,
-    rc::Rc,
     path::Path,
     hash::{Hash, Hasher},
     sync::atomic::{AtomicUsize, Ordering},
+    cmp::Ordering as CmpOrdering,
     collections::BTreeMap,
     iter::FromIterator,
 };
-use glium::{Texture2d, framebuffer::SimpleFrameBuffer};
 use azul_css::{ NodeTypePath, CssProperty };
 use {
     ui_state::UiState,
-    FastHashMap,
-    window::{CallbackInfo, LayoutInfo},
-    images::{ImageId, ImageState},
-    text_cache::TextId,
+    callbacks::{
+        DefaultCallbackId, StackCheckedPointer,
+        Callback, GlTextureCallback, IFrameCallback,
+    },
+    app_resources::{ImageId, TextId},
     traits::Layout,
-    app_state::AppState,
     id_tree::{Arena, NodeDataContainer},
-    default_callbacks::{DefaultCallbackId, StackCheckedPointer},
-    window::HidpiAdjustedBounds,
-    text_layout::{Words, FontMetrics, TextSizePx},
-    xml::{XmlParseError, XmlComponentMap},
+    xml::{self, XmlParseError, XmlComponentMap},
 };
 
 pub use id_tree::{NodeHierarchy, Node, NodeId};
@@ -42,53 +38,60 @@ pub(crate) fn new_scroll_tag_id() -> ScrollTagId {
     ScrollTagId(new_tag_id())
 }
 
+static DOM_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// DomID - used for identifying different DOMs (for example IFrameCallbacks)
+/// have a different DomId than the root DOM
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DomId {
+    /// Unique ID for this DOM
+    id: usize,
+    /// If this DOM was generated from an IFrameCallback, stores the parents
+    /// DomId + the NodeId (from the parent DOM) which the IFrameCallback
+    /// was attached to.
+    parent: Option<(Box<DomId>, NodeId)>,
+}
+
+pub(crate) fn new_dom_id(parent: Option<(DomId, NodeId)>) -> DomId {
+    let new_dom_id = DOM_ID.fetch_add(1, Ordering::SeqCst);
+    DomId {
+        id: new_dom_id,
+        parent: parent.map(|(p, node_id)| (Box::new(p), node_id)),
+    }
+}
+
+/// Reset the DOM ID to 1, usually done once-per-frame for the root DOM
+pub(crate) fn reset_dom_id() {
+    DOM_ID.swap(1, Ordering::SeqCst);
+}
+
+impl DomId {
+
+    /// Creates an ID for the root node
+    #[inline]
+    pub(crate) const fn create_root_dom_id() -> Self  {
+        Self {
+            id: 0,
+            parent: None,
+        }
+    }
+
+    /// Returns if this is the root node
+    pub fn is_root(&self) -> bool {
+        *self == Self::create_root_dom_id()
+    }
+}
+
 /// Calculated hash of a DOM node, used for querying attributes of the DOM node
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
 pub struct DomHash(pub u64);
-
-/// A callback function has to return if the screen should
-/// be updated after the function has run.
-///
-/// NOTE: This is currently a typedef for `Option<()>`,
-/// so that you can use the `?` operator in callbacks
-/// (to simply not redraw if there is an error). This was an enum previously,
-/// but since Rust doesn't have a "custom try" operator, this led to a lot of
-/// usability problems. In the future, this might change back to an enum therefore
-/// the constants "Redraw" and "DontRedraw" are not capitalized, to minimize breakage.
-pub type UpdateScreen = Option<()>;
-/// After the callback is called, the screen needs to redraw
-/// (layout() function being called again).
-#[allow(non_upper_case_globals)]
-pub const Redraw: Option<()> = Some(());
-/// The screen does not need to redraw after the callback has been called.
-#[allow(non_upper_case_globals)]
-pub const DontRedraw: Option<()> = None;
-
-pub type CallbackType<T> = fn(&mut AppState<T>, &mut CallbackInfo<T>) -> UpdateScreen;
-/// Stores a function pointer that is executed when the given UI element is hit
-///
-/// Must return an `UpdateScreen` that denotes if the screen should be redrawn.
-/// The style is not affected by this, so if you make changes to the window's style
-/// inside the function, the screen will not be automatically redrawn, unless you return
-/// an `UpdateScreen::Redraw` from the function
-pub struct Callback<T: Layout>(pub CallbackType<T>);
-impl_callback_bounded!(Callback<T: Layout>);
-
-pub type GlTextureCallbackType<T> = fn(&StackCheckedPointer<T>, LayoutInfo<T>, HidpiAdjustedBounds) -> Option<Texture>;
-pub struct GlTextureCallback<T: Layout>(pub GlTextureCallbackType<T>);
-impl_callback_bounded!(GlTextureCallback<T: Layout>);
-
-pub type IFrameCallbackType<T> = fn(&StackCheckedPointer<T>, LayoutInfo<T>, HidpiAdjustedBounds) -> Dom<T>;
-pub struct IFrameCallback<T: Layout>(pub IFrameCallbackType<T>);
-impl_callback_bounded!(IFrameCallback<T: Layout>);
-
 
 /// List of core DOM node types built-into by `azul`.
 pub enum NodeType<T: Layout> {
     /// Regular div with no particular type of data attached
     Div,
     /// A small label that can be (optionally) be selectable with the mouse
-    Label(String),
+    Label(DomString),
     /// Larger amount of text, that has to be cached
     Text(TextId),
     /// An image that is rendered by WebRender. The id is acquired by the
@@ -176,7 +179,7 @@ impl<T: Layout> PartialEq for NodeType<T> {
 impl<T: Layout> Eq for NodeType<T> { }
 
 impl<T: Layout> NodeType<T> {
-
+    #[inline]
     pub(crate) fn get_path(&self) -> NodeTypePath {
         use self::NodeType::*;
         match self {
@@ -185,46 +188,6 @@ impl<T: Layout> NodeType<T> {
             Image(_) => NodeTypePath::Img,
             GlTexture(_) => NodeTypePath::Texture,
             IFrame(_) => NodeTypePath::IFrame,
-        }
-    }
-
-    /// Returns the preferred width, for example for an image, that would be the
-    /// original width (an image always wants to take up the original space)
-    pub(crate) fn get_preferred_width(&self, image_cache: &FastHashMap<ImageId, ImageState>) -> Option<f32> {
-        use self::NodeType::*;
-        match self {
-            Image(i) => image_cache.get(i).and_then(|image_state| Some(image_state.get_dimensions().0)),
-            Label(_) | Text(_) => /* TODO: Calculate the minimum width for the text? */ None,
-            _ => None,
-        }
-    }
-
-    /// Given a certain width, returns the
-    pub(crate) fn get_preferred_height_based_on_width(
-        &self,
-        div_width: TextSizePx,
-        image_cache: &FastHashMap<ImageId, ImageState>,
-        words: Option<&Words>,
-        font_metrics: Option<FontMetrics>,
-    ) -> Option<TextSizePx>
-    {
-        use self::NodeType::*;
-        use azul_css::{LayoutOverflow, TextOverflowBehaviour, TextOverflowBehaviourInner};
-
-        match self {
-            Image(i) => image_cache.get(i).and_then(|image_state| {
-                let (image_original_height, image_original_width) = image_state.get_dimensions();
-                Some(div_width * (image_original_width / image_original_height))
-            }),
-            Label(_) | Text(_) => {
-                let (words, font) = (words?, font_metrics?);
-                let vertical_info = words.get_vertical_height(&LayoutOverflow {
-                    horizontal: TextOverflowBehaviour::Modified(TextOverflowBehaviourInner::Scroll),
-                    .. Default::default()
-                }, &font, div_width);
-                Some(vertical_info.vertical_height)
-            }
-            _ => None,
         }
     }
 }
@@ -320,10 +283,6 @@ pub enum EventFilter {
     /// (i.e. global gestures that aren't attached to any component, but rather
     /// the "window" itself).
     Window(WindowEventFilter),
-    /// Calls the callback when anything on the desktop is happening, useful
-    /// for creating keyloggers (for example to implement a desktop search bar
-    /// like everything or Spotlight) - fires even when the window isn't focused.
-    Desktop(DesktopEventFilter),
 }
 
 /// Creates a function inside an impl <enum type> block that returns a single
@@ -358,7 +317,6 @@ impl EventFilter {
     get_single_enum_type!(as_focus_event_filter, EventFilter::Focus(FocusEventFilter));
     get_single_enum_type!(as_not_event_filter, EventFilter::Not(NotEventFilter));
     get_single_enum_type!(as_window_event_filter, EventFilter::Window(WindowEventFilter));
-    get_single_enum_type!(as_desktop_event_filter, EventFilter::Desktop(DesktopEventFilter));
 }
 
 impl From<On> for EventFilter {
@@ -390,6 +348,7 @@ impl From<On> for EventFilter {
     }
 }
 
+/// Event filter that only fires when an element is hovered over
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum HoverEventFilter {
     MouseOver,
@@ -438,12 +397,19 @@ impl HoverEventFilter {
     }
 }
 
+/// The inverse of an `onclick` event filter, fires when an item is *not* hovered / focused.
+/// This is useful for cleanly implementing things like popover dialogs or dropdown boxes that
+/// want to close when the user clicks any where *but* the item itself.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NotEventFilter {
     Hover(HoverEventFilter),
     Focus(FocusEventFilter),
 }
 
+/// Event filter similar to `HoverEventFilter` that only fires when the element is focused
+///
+/// **Important**: In order for this to fire, the item must have a `tabindex` attribute
+/// (to indicate that the item is focus-able).
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FocusEventFilter {
     MouseOver,
@@ -465,6 +431,8 @@ pub enum FocusEventFilter {
     FocusLost,
 }
 
+/// Event filter that fires when any action fires on the entire window
+/// (regardless of whether any element is hovered or focused over).
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WindowEventFilter {
     MouseOver,
@@ -507,21 +475,12 @@ impl WindowEventFilter {
             HoveredFile => Some(HoverEventFilter::HoveredFile),
             DroppedFile => Some(HoverEventFilter::DroppedFile),
             HoveredFileCancelled => Some(HoverEventFilter::HoveredFileCancelled),
-            // MouseEnter and MouseLeave on the **window** does not mean a mouseenter and a mouseleave on the hovered element
+            // MouseEnter and MouseLeave on the **window** - does not mean a mouseenter
+            // and a mouseleave on the hovered element
             MouseEnter => None,
             MouseLeave => None,
         }
     }
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum DesktopEventFilter {
-    DeviceAdded,
-    DeviceRemoved,
-    ControllerMotion,
-    AppSuspended,
-    AppResumed,
-    Awakened,
 }
 
 /// Represents one single DOM node (node type, classes, ids and callbacks are stored here)
@@ -529,9 +488,9 @@ pub struct NodeData<T: Layout> {
     /// `div`
     pub node_type: NodeType<T>,
     /// `#main #something`
-    pub ids: Vec<String>,
+    pub ids: Vec<DomString>,
     /// `.myclass .otherclass`
-    pub classes: Vec<String>,
+    pub classes: Vec<DomString>,
     /// `On::MouseUp` -> `Callback(my_button_click_handler)`
     pub callbacks: Vec<(EventFilter, Callback<T>)>,
     /// Usually not set by the user directly - `FakeWindow::add_default_callback`
@@ -555,11 +514,11 @@ pub struct NodeData<T: Layout> {
     ///     dynamic_css_overrides: vec![("my_custom_width".into(), CssProperty::Width(LayoutWidth::px(500.0)))]
     /// }
     /// ```
-    pub dynamic_css_overrides: Vec<(String, CssProperty)>,
+    pub dynamic_css_overrides: Vec<(DomString, CssProperty)>,
     /// Whether this div can be dragged or not, similar to `draggable = "true"` in HTML, .
     ///
     /// **TODO**: Currently doesn't do anything, since the drag & drop implementation is missing, API stub.
-    pub draggable: bool,
+    pub is_draggable: bool,
     /// Whether this div can be focused, and if yes, in what default to `None` (not focusable).
     /// Note that without this, there can be no `On::FocusReceived` (equivalent to onfocus),
     /// `On::FocusLost` (equivalent to onblur), etc. events.
@@ -612,7 +571,7 @@ impl<T: Layout> PartialEq for NodeData<T> {
         self.callbacks == other.callbacks &&
         self.default_callback_ids == other.default_callback_ids &&
         self.dynamic_css_overrides == other.dynamic_css_overrides &&
-        self.draggable == other.draggable &&
+        self.is_draggable == other.is_draggable &&
         self.tab_index == other.tab_index
     }
 }
@@ -628,7 +587,7 @@ impl<T: Layout> Default for NodeData<T> {
             callbacks: Vec::new(),
             default_callback_ids: Vec::new(),
             dynamic_css_overrides: Vec::new(),
-            draggable: false,
+            is_draggable: false,
             tab_index: None,
         }
     }
@@ -652,7 +611,7 @@ impl<T: Layout> Hash for NodeData<T> {
         for dynamic_css_override in &self.dynamic_css_overrides {
             dynamic_css_override.hash(state);
         }
-        self.draggable.hash(state);
+        self.is_draggable.hash(state);
         self.tab_index.hash(state);
     }
 }
@@ -666,7 +625,7 @@ impl<T: Layout> Clone for NodeData<T> {
             callbacks: self.callbacks.clone(),
             default_callback_ids: self.default_callback_ids.clone(),
             dynamic_css_overrides: self.dynamic_css_overrides.clone(),
-            draggable: self.draggable.clone(),
+            is_draggable: self.is_draggable.clone(),
             tab_index: self.tab_index.clone(),
         }
     }
@@ -703,24 +662,24 @@ impl<T: Layout> fmt::Debug for NodeData<T> {
                 \tcallbacks: {:?}, \
                 \tdefault_callback_ids: {:?}, \
                 \tdynamic_css_overrides: {:?}, \
-                \tdraggable: {:?}, \
+                \tis_draggable: {:?}, \
                 \ttab_index: {:?}, \
             }}",
-        self.node_type,
-        self.ids,
-        self.classes,
-        self.callbacks,
-        self.default_callback_ids,
-        self.dynamic_css_overrides,
-        self.draggable,
-        self.tab_index)
+            self.node_type,
+            self.ids,
+            self.classes,
+            self.callbacks,
+            self.default_callback_ids,
+            self.dynamic_css_overrides,
+            self.is_draggable,
+            self.tab_index,
+        )
     }
 }
 
 impl<T: Layout> NodeData<T> {
 
     pub(crate) fn calculate_node_data_hash(&self) -> DomHash {
-        use std::hash::Hash;
 
         // Pick hash algorithm based on features
         #[cfg(feature = "faster-hashing")]
@@ -748,14 +707,76 @@ impl<T: Layout> NodeData<T> {
 
     /// Checks whether this node has the searched ID attached
     pub fn has_id(&self, id: &str) -> bool {
-        self.ids.iter().any(|self_id| self_id == id)
+        self.ids.iter().any(|self_id| self_id.equals_str(id))
     }
 
     /// Checks whether this node has the searched class attached
     pub fn has_class(&self, class: &str) -> bool {
-        self.classes.iter().any(|self_class| self_class == class)
+        self.classes.iter().any(|self_class| self_class.equals_str(class))
     }
 }
+
+/// Most strings are known at compile time, spares a bit of
+/// heap allocations - for `&'static str`, simply stores the pointer,
+/// instead of converting it into a String. This is good for class names
+/// or IDs, whose content rarely changes.
+#[derive(Debug, Clone, Eq)]
+pub enum DomString {
+    Static(&'static str),
+    Heap(String),
+}
+
+impl PartialEq for DomString {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl PartialOrd for DomString {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.as_str().cmp(other.as_str()))
+    }
+}
+
+impl Ord for DomString {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl Hash for DomString {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+impl DomString {
+
+    pub fn equals_str(&self, target: &str) -> bool {
+        use self::DomString::*;
+        match &self {
+            Static(s) => *s == target,
+            Heap(h) => h == target,
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        use self::DomString::*;
+        match &self {
+            Static(s) => s,
+            Heap(h) => h,
+        }
+    }
+}
+
+impl_display!{ DomString, {
+    Static(s) => format!("{}", s),
+    Heap(h) => h,
+}}
+
+type StaticString = &'static str;
+impl_from!(String, DomString::Heap);
+impl_from!(StaticString, DomString::Static);
 
 /// The document model, similar to HTML. This is a create-only structure, you don't actually read anything back
 #[derive(Clone, PartialEq, Eq)]
@@ -787,8 +808,6 @@ impl<T: Layout> FromIterator<Dom<T>> for Dom<T> {
 
 impl<T: Layout> FromIterator<NodeData<T>> for Dom<T> {
     fn from_iter<I: IntoIterator<Item=NodeData<T>>>(iter: I) -> Self {
-
-        use id_tree::Node;
 
         // We have to use a "root" node, otherwise we run into problems if
         // the iterator executes 0 times (and therefore pushes 0 nodes)
@@ -856,29 +875,15 @@ impl<T: Layout> Dom<T> {
         Self::with_capacity(node_type, 0)
     }
 
-    /// Parses and loads a DOM from an XML string
-    pub fn from_xml(xml: &str, component_map: &XmlComponentMap<T>) -> Result<Self, XmlParseError> {
-        use xml;
-        let parsed_xml = xml::parse_xml_string(xml)?;
-        let expanded_xml = xml::expand_xml_components(&parsed_xml)?;
-        xml::render_dom_from_app_node(&expanded_xml, component_map)
-    }
-
-    /// For hot-reloading only: Reloads a DOM from an XML file
-    ///
-    /// This function deliberately never fails: In an error case, the
-    /// error gets rendered as a `NodeType::Label`.
-    pub fn from_file<I: AsRef<Path>>(file_path: I, component_map: &XmlComponentMap<T>) -> Self {
-        use std::fs;
-
-        let xml = match fs::read_to_string(file_path) {
-            Ok(xml) => xml,
-            Err(e) => return Dom::label(format!("{}", e)),
-        };
-
-        match Self::from_xml(&xml, component_map) {
-            Ok(o) => o,
-            Err(e) => Dom::label(format!("{}", e)),
+    /// Creates an empty DOM with space reserved for `cap` nodes
+    #[inline]
+    pub fn with_capacity(node_type: NodeType<T>, cap: usize) -> Self {
+        let mut arena = Arena::with_capacity(cap.saturating_add(1));
+        let root = arena.new_node(NodeData::new(node_type));
+        Self {
+            arena: arena,
+            root: root,
+            head: root,
         }
     }
 
@@ -889,7 +894,8 @@ impl<T: Layout> Dom<T> {
     }
 
     /// Shorthand for `Dom::new(NodeType::Label(value.into()))`
-    pub fn label<S: Into<String>>(value: S) -> Self {
+    #[inline]
+    pub fn label<S: Into<DomString>>(value: S) -> Self {
         Self::new(NodeType::Label(value.into()))
     }
 
@@ -917,22 +923,45 @@ impl<T: Layout> Dom<T> {
         Self::new(NodeType::IFrame((callback, ptr)))
     }
 
+    /// Parses and loads a DOM from an XML string
+    #[inline]
+    pub fn from_xml(xml: &str, component_map: &mut XmlComponentMap<T>) -> Result<Self, XmlParseError> {
+        xml::str_to_dom(xml, component_map)
+    }
+
+    /// Loads, parses and builds a DOM from an XML file - warning: Disk I/O on every
+    /// function call - do not use this in release builds! This function deliberately
+    /// never fails: In an error case, the error gets rendered as a `NodeType::Label`.
+    pub fn from_file<I: AsRef<Path>>(file_path: I, component_map: &mut XmlComponentMap<T>) -> Self {
+        use std::fs;
+
+        let xml = match fs::read_to_string(file_path) {
+            Ok(xml) => xml,
+            Err(e) => return Dom::label(format!("{}", e)),
+        };
+
+        match Self::from_xml(&xml, component_map) {
+            Ok(o) => o,
+            Err(e) => Dom::label(format!("{}", e)),
+        }
+    }
+
     /// Returns the number of nodes in this DOM
     #[inline]
     pub fn len(&self) -> usize {
         self.arena.len()
     }
 
-    /// Creates an empty DOM with space reserved for `cap` nodes
+    /// Returns an immutable reference to the current HEAD of the DOM structure (the last inserted element)
     #[inline]
-    pub fn with_capacity(node_type: NodeType<T>, cap: usize) -> Self {
-        let mut arena = Arena::with_capacity(cap.saturating_add(1));
-        let root = arena.new_node(NodeData::new(node_type));
-        Self {
-            arena: arena,
-            root: root,
-            head: root,
-        }
+    pub fn get_head_node(&self) -> &NodeData<T> {
+        &self.arena.node_data[self.head]
+    }
+
+    /// Returns a mutable reference to the current HEAD of the DOM structure (the last inserted element)
+    #[inline]
+    pub fn get_head_node_mut(&mut self) -> &mut NodeData<T> {
+        &mut self.arena.node_data[self.head]
     }
 
     /// Adds a child DOM to the current DOM
@@ -980,10 +1009,7 @@ impl<T: Layout> Dom<T> {
                 }
             }
 
-            if node_id_child.parent.as_mut().and_then(|parent| {
-                *parent += self_len;
-                Some(parent)
-            }).is_none() {
+            if node_id_child.parent.as_mut().map(|parent| { *parent += self_len; parent }).is_none() {
                 // Have we encountered the last root item?
                 if node_id_child.next_sibling.is_none() {
                     last_sibling = Some(node_id);
@@ -1012,14 +1038,14 @@ impl<T: Layout> Dom<T> {
 
     /// Same as `id`, but easier to use for method chaining in a builder-style pattern
     #[inline]
-    pub fn with_id<S: Into<String>>(mut self, id: S) -> Self {
+    pub fn with_id<S: Into<DomString>>(mut self, id: S) -> Self {
         self.add_id(id);
         self
     }
 
     /// Same as `id`, but easier to use for method chaining in a builder-style pattern
     #[inline]
-    pub fn with_class<S: Into<String>>(mut self, class: S) -> Self {
+    pub fn with_class<S: Into<DomString>>(mut self, class: S) -> Self {
         self.add_class(class);
         self
     }
@@ -1038,7 +1064,7 @@ impl<T: Layout> Dom<T> {
     }
 
     #[inline]
-    pub fn with_css_override<S: Into<String>>(mut self, id: S, property: CssProperty) -> Self {
+    pub fn with_css_override<S: Into<DomString>>(mut self, id: S, property: CssProperty) -> Self {
         self.add_css_override(id, property);
         self
     }
@@ -1056,12 +1082,12 @@ impl<T: Layout> Dom<T> {
     }
 
     #[inline]
-    pub fn add_id<S: Into<String>>(&mut self, id: S) {
+    pub fn add_id<S: Into<DomString>>(&mut self, id: S) {
         self.arena.node_data[self.head].ids.push(id.into());
     }
 
     #[inline]
-    pub fn add_class<S: Into<String>>(&mut self, class: S) {
+    pub fn add_class<S: Into<DomString>>(&mut self, class: S) {
         self.arena.node_data[self.head].classes.push(class.into());
     }
 
@@ -1076,7 +1102,7 @@ impl<T: Layout> Dom<T> {
     }
 
     #[inline]
-    pub fn add_css_override<S: Into<String>>(&mut self, override_id: S, property: CssProperty) {
+    pub fn add_css_override<S: Into<DomString>>(&mut self, override_id: S, property: CssProperty) {
         self.arena.node_data[self.head].dynamic_css_overrides.push((override_id.into(), property));
     }
 
@@ -1087,7 +1113,7 @@ impl<T: Layout> Dom<T> {
 
     #[inline]
     pub fn set_draggable(&mut self, draggable: bool) {
-        self.arena.node_data[self.head].draggable = draggable;
+        self.arena.node_data[self.head].is_draggable = draggable;
     }
 
     /// Prints a debug formatted version of the DOM for easier debugging
@@ -1133,8 +1159,6 @@ impl<T: Layout> Dom<T> {
         let mut not_default_callbacks = BTreeMap::new();
         let mut window_callbacks = BTreeMap::new();
         let mut window_default_callbacks = BTreeMap::new();
-        let mut desktop_callbacks = BTreeMap::new();
-        let mut desktop_default_callbacks = BTreeMap::new();
 
         // data.callbacks, HoverEventFilter, Callback<T>, as_hover_event_filter, hover_callbacks, <node_tag_id> (optional)
         macro_rules! filter_and_insert_callbacks {
@@ -1185,17 +1209,17 @@ impl<T: Layout> Dom<T> {
 
             for node_id in arena.linear_iter() {
 
-                let data = &arena.node_data[node_id];
+                let node = &arena.node_data[node_id];
 
                 let mut node_tag_id = None;
 
                 // Optimization since on most nodes, the callbacks will be empty
-                if !data.callbacks.is_empty() {
+                if !node.callbacks.is_empty() {
 
                     // Filter and insert HoverEventFilter callbacks
                     filter_and_insert_callbacks!(
                         node_id,
-                        data.callbacks,
+                        node.callbacks,
                         HoverEventFilter,
                         Callback<T>,
                         as_hover_event_filter,
@@ -1206,7 +1230,7 @@ impl<T: Layout> Dom<T> {
                     // Filter and insert FocusEventFilter callbacks
                     filter_and_insert_callbacks!(
                         node_id,
-                        data.callbacks,
+                        node.callbacks,
                         FocusEventFilter,
                         Callback<T>,
                         as_focus_event_filter,
@@ -1216,7 +1240,7 @@ impl<T: Layout> Dom<T> {
 
                     filter_and_insert_callbacks!(
                         node_id,
-                        data.callbacks,
+                        node.callbacks,
                         NotEventFilter,
                         Callback<T>,
                         as_not_event_filter,
@@ -1226,29 +1250,20 @@ impl<T: Layout> Dom<T> {
 
                     filter_and_insert_callbacks!(
                         node_id,
-                        data.callbacks,
+                        node.callbacks,
                         WindowEventFilter,
                         Callback<T>,
                         as_window_event_filter,
                         window_callbacks,
                     );
-
-                    filter_and_insert_callbacks!(
-                        node_id,
-                        data.callbacks,
-                        DesktopEventFilter,
-                        Callback<T>,
-                        as_desktop_event_filter,
-                        desktop_callbacks,
-                    );
                 }
 
-                if !data.default_callback_ids.is_empty() {
+                if !node.default_callback_ids.is_empty() {
 
                     // Filter and insert HoverEventFilter callbacks
                     filter_and_insert_callbacks!(
                         node_id,
-                        data.default_callback_ids,
+                        node.default_callback_ids,
                         HoverEventFilter,
                         DefaultCallbackId,
                         as_hover_event_filter,
@@ -1259,7 +1274,7 @@ impl<T: Layout> Dom<T> {
                     // Filter and insert FocusEventFilter callbacks
                     filter_and_insert_callbacks!(
                         node_id,
-                        data.default_callback_ids,
+                        node.default_callback_ids,
                         FocusEventFilter,
                         DefaultCallbackId,
                         as_focus_event_filter,
@@ -1269,7 +1284,7 @@ impl<T: Layout> Dom<T> {
 
                     filter_and_insert_callbacks!(
                         node_id,
-                        data.default_callback_ids,
+                        node.default_callback_ids,
                         NotEventFilter,
                         DefaultCallbackId,
                         as_not_event_filter,
@@ -1279,30 +1294,21 @@ impl<T: Layout> Dom<T> {
 
                     filter_and_insert_callbacks!(
                         node_id,
-                        data.default_callback_ids,
+                        node.default_callback_ids,
                         WindowEventFilter,
                         DefaultCallbackId,
                         as_window_event_filter,
                         window_default_callbacks,
                     );
-
-                    filter_and_insert_callbacks!(
-                        node_id,
-                        data.default_callback_ids,
-                        DesktopEventFilter,
-                        DefaultCallbackId,
-                        as_desktop_event_filter,
-                        desktop_default_callbacks,
-                    );
                 }
 
-                if data.draggable {
+                if node.is_draggable {
                     let tag_id = node_tag_id.unwrap_or_else(|| new_tag_id());
                     draggable_tags.insert(tag_id, node_id);
                     node_tag_id = Some(tag_id);
                 }
 
-                if let Some(tab_index) = data.tab_index {
+                if let Some(tab_index) = node.tab_index {
                     let tag_id = node_tag_id.unwrap_or_else(|| new_tag_id());
                     tab_index_tags.insert(tag_id, (node_id, tab_index));
                     node_tag_id = Some(tag_id);
@@ -1314,8 +1320,8 @@ impl<T: Layout> Dom<T> {
                 }
 
                 // Collect all the styling overrides into one hash map
-                if !data.dynamic_css_overrides.is_empty() {
-                    dynamic_css_overrides.insert(node_id, data.dynamic_css_overrides.iter().cloned().collect());
+                if !node.dynamic_css_overrides.is_empty() {
+                    dynamic_css_overrides.insert(node_id, node.dynamic_css_overrides.iter().cloned().collect());
                 }
             }
         }
@@ -1339,63 +1345,10 @@ impl<T: Layout> Dom<T> {
             not_default_callbacks,
             window_callbacks,
             window_default_callbacks,
-            desktop_callbacks,
-            desktop_default_callbacks,
 
         }
     }
 }
-
-/// OpenGL texture, use `ReadOnlyWindow::create_texture` to create a texture
-///
-/// **WARNING**: Don't forget to call `ReadOnlyWindow::unbind_framebuffer()`
-/// when you are done with your OpenGL drawing, otherwise WebRender will render
-/// to the texture, not the window, so your texture will actually never show up.
-/// If you use a `Texture` and you get a blank screen, this is probably why.
-#[derive(Debug, Clone)]
-pub struct Texture {
-    pub(crate) inner: Rc<Texture2d>,
-}
-
-impl Texture {
-    /// Note: You can initialize this texture from an existing (external texture).
-    pub fn new(tex: Texture2d) -> Self {
-        Self {
-            inner: Rc::new(tex),
-        }
-    }
-
-    /// Prepares the texture for drawing - you can only draw
-    /// on a framebuffer, the texture itself is readonly from the
-    /// OpenGL drivers point of view.
-    ///
-    /// **WARNING**: Don't forget to call `ReadOnlyWindow::unbind_framebuffer()`
-    /// when you are done with your OpenGL drawing, otherwise WebRender will render
-    /// to the texture instead of the window, so your texture will actually
-    /// never show up on the screen, since it is never rendered.
-    /// If you use a `Texture` and you get a blank screen, this is probably why.
-    pub fn as_surface<'a>(&'a self) -> SimpleFrameBuffer<'a> {
-        self.inner.as_surface()
-    }
-}
-
-impl Hash for Texture {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        use glium::GlObject;
-        self.inner.get_id().hash(state);
-    }
-}
-
-impl PartialEq for Texture {
-    /// Note: Comparison uses only the OpenGL ID, it doesn't compare the
-    /// actual contents of the texture.
-    fn eq(&self, other: &Texture) -> bool {
-        use glium::GlObject;
-        self.inner.get_id() == other.inner.get_id()
-    }
-}
-
-impl Eq for Texture { }
 
 #[test]
 fn test_dom_sibling_1() {
@@ -1422,13 +1375,13 @@ fn test_dom_sibling_1() {
 
     assert_eq!(NodeId::new(0), dom.root);
 
-    assert_eq!(vec![String::from("sibling-1")],
+    assert_eq!(vec![DomString::Static("sibling-1")],
         arena.node_data[
             arena.node_layout[dom.root]
             .first_child.expect("root has no first child")
         ].ids);
 
-    assert_eq!(vec![String::from("sibling-2")],
+    assert_eq!(vec![DomString::Static("sibling-2")],
         arena.node_data[
             arena.node_layout[
                 arena.node_layout[dom.root]
@@ -1436,7 +1389,7 @@ fn test_dom_sibling_1() {
             ].next_sibling.expect("root has no second sibling")
         ].ids);
 
-    assert_eq!(vec![String::from("sibling-1-child-1")],
+    assert_eq!(vec![DomString::Static("sibling-1-child-1")],
         arena.node_data[
             arena.node_layout[
                 arena.node_layout[dom.root]
@@ -1444,7 +1397,7 @@ fn test_dom_sibling_1() {
             ].first_child.expect("first child has no first child")
         ].ids);
 
-    assert_eq!(vec![String::from("sibling-2-child-1")],
+    assert_eq!(vec![DomString::Static("sibling-2-child-1")],
         arena.node_data[
             arena.node_layout[
                 arena.node_layout[
@@ -1464,7 +1417,7 @@ fn test_dom_from_iter_1() {
 
     impl Layout for TestLayout {
         fn layout(&self) -> Dom<Self> {
-            (0..5).map(|e| NodeData::new(NodeType::Label(format!("{}", e + 1)))).collect()
+            (0..5).map(|e| NodeData::new(NodeType::Label(DomString::Heap(format!("{}", e + 1))))).collect()
         }
     }
 
@@ -1499,11 +1452,11 @@ fn test_dom_from_iter_1() {
         first_child: None,
         last_child: None,
     }));
+
     assert_eq!(arena.node_data.get(NodeId::new(arena.node_data.len() - 1)), Some(&NodeData {
-        node_type: NodeType::Label(String::from("5")),
+        node_type: NodeType::Label(DomString::Heap(String::from("5"))),
         .. Default::default()
     }));
-
 }
 
 /// Test that there shouldn't be a DOM that has 0 nodes
@@ -1514,7 +1467,7 @@ fn test_zero_size_dom() {
 
     impl Layout for TestLayout {
         fn layout(&self) -> Dom<Self> {
-            Dom::new(NodeType::Div)
+            Dom::div()
         }
     }
 

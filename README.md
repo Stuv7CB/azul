@@ -7,7 +7,7 @@
 [![Build Status Linux / macOS](https://travis-ci.org/maps4print/azul.svg?branch=master)](https://travis-ci.org/maps4print/azul)
 [![Build status Windows](https://ci.appveyor.com/api/projects/status/p487hewqh6bxeucv?svg=true)](https://ci.appveyor.com/project/fschutt/azul)
 [![Coverage Status](https://coveralls.io/repos/github/maps4print/azul/badge.svg?branch=master)](https://coveralls.io/github/maps4print/azul?branch=master)
-[![LICENSE](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Rust Compiler Version](https://img.shields.io/badge/rustc-1.30%20stable-blue.svg)]()
+[![LICENSE](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Rust Compiler Version](https://img.shields.io/badge/rustc-1.31%20stable-blue.svg)]()
 <!-- [END badges] -->
 
 > Azul is a free, functional, immediate mode GUI framework that is built on the Mozilla WebRender rendering engine for rapid development
@@ -47,15 +47,13 @@ This application is created by the following code:
 ```rust
 extern crate azul;
 
-use azul::{prelude::*, widgets::{label::Label, button::Button}};
+use azul::prelude::*;
 
-struct DataModel {
-    counter: usize,
-}
+struct MyDataModel { }
 
-impl Layout for DataModel {
+impl Layout for MyDataModel {
     // Model renders View
-    fn layout(&self, _info: LayoutInfo<Self>) -> Dom<Self> {
+    fn layout(&self, _: LayoutInfo<Self>) -> Dom<Self> {
         let label = Label::new(format!("{}", self.counter)).dom();
         let button = Button::with_label("Update counter").dom()
             .with_callback(On::MouseUp, Callback(update_counter));
@@ -73,8 +71,9 @@ fn update_counter(app_state: &mut AppState<DataModel>, _event: &mut CallbackInfo
 }
 
 fn main() {
-    let app = App::new(DataModel { counter: 0 }, AppConfig::default());
-    app.run(Window::new(WindowCreateOptions::default(), css::native()).unwrap()).unwrap();
+    let mut app = App::new(MyDataModel { }, AppConfig::default()).unwrap();
+    let window = app.create_window(WindowCreateOptions::default(), css::native()).unwrap();
+    app.run(window).unwrap();
 }
 ```
 

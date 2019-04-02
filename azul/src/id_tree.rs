@@ -1,8 +1,7 @@
-//! ID-based node tree
-
 use std::{
     ops::{Index, IndexMut},
     collections::BTreeMap,
+    slice::{Iter, IterMut},
 };
 
 pub use self::node_id::NodeId;
@@ -34,24 +33,12 @@ mod node_id {
         /// it is more likely that you run out of RAM before you do that. The only thing
         /// that could lead to an overflow would be a bug. Therefore, overflow-checking is
         /// disabled in release mode.
-        #[cfg_attr(not(debug_assertions), inline(always))]
+        #[inline(always)]
         pub(crate) fn new(value: usize) -> Self {
-
-            #[cfg(debug_assertions)] {
-                let (new_value, has_overflown) = value.overflowing_add(1);
-                if has_overflown {
-                    panic!("Overflow when creating DOM Node with ID {}", value);
-                } else {
-                    NodeId { index: NonZeroUsize::new(new_value).unwrap() }
-                }
-            }
-
-            #[cfg(not(debug_assertions))] {
-                NodeId { index: unsafe { NonZeroUsize::new_unchecked(value + 1) } }
-            }
+            NodeId { index: unsafe { NonZeroUsize::new_unchecked(value + 1) } }
         }
 
-        #[inline]
+        #[inline(always)]
         pub fn index(&self) -> usize {
             self.index.get() - 1
         }
@@ -83,6 +70,7 @@ mod node_id {
     }
 }
 
+/// Hierarchical information about a node (stores the indicies of the parent / child nodes).
 #[derive(Debug, Default, Copy, Clone, PartialOrd, Ord, PartialEq, Eq, Hash)]
 pub struct Node {
     pub parent: Option<NodeId>,
@@ -106,13 +94,18 @@ pub struct Arena<T> {
     pub(crate) node_data: NodeDataContainer<T>,
 }
 
+/// The hierarchy of nodes is stored separately from the actual node content in order
+/// to save on memory, since the hierarchy can be re-used across several DOM trees even
+/// if the content changes.
 #[derive(Debug, Default, Clone, PartialEq, Hash, Eq)]
 pub struct NodeHierarchy {
     pub(crate) internal: Vec<Node>,
 }
 
 impl NodeHierarchy {
-    pub fn new(data: Vec<Node>) -> Self {
+
+    #[inline]
+    pub const fn new(data: Vec<Node>) -> Self {
         Self {
             internal: data,
         }
@@ -146,6 +139,7 @@ impl NodeHierarchy {
         let mut depth = 1;
 
         loop {
+
             for id in &current_children {
                 for child_id in id.1.children(self).filter(|id| self[*id].first_child.is_some()) {
                     next_children.push((depth, child_id));
@@ -200,7 +194,9 @@ impl IndexMut<NodeId> for NodeHierarchy {
 }
 
 impl<T> NodeDataContainer<T> {
-    pub fn new(data: Vec<T>) -> Self {
+
+    #[inline]
+    pub const fn new(data: Vec<T>) -> Self {
         Self {
             internal: data,
         }
@@ -217,6 +213,13 @@ impl<T> NodeDataContainer<T> {
 
     pub fn get(&self, id: NodeId) -> Option<&T> {
         self.internal.get(id.index())
+    }
+
+    pub fn iter(&self) -> Iter<T> {
+        self.internal.iter()
+    }
+    pub fn iter_mut(&mut self) -> IterMut<T> {
+        self.internal.iter_mut()
     }
 
     pub fn linear_iter(&self) -> LinearIterator {
@@ -376,7 +379,8 @@ impl NodeId {
     /// Return an iterator of references to this node and its ancestors.
     ///
     /// Call `.next().unwrap()` once on the iterator to skip the node itself.
-    pub fn ancestors(self, node_layout: &NodeHierarchy) -> Ancestors {
+    #[inline]
+    pub const fn ancestors(self, node_layout: &NodeHierarchy) -> Ancestors {
         Ancestors {
             node_layout,
             node: Some(self),
@@ -386,7 +390,8 @@ impl NodeId {
     /// Return an iterator of references to this node and the siblings before it.
     ///
     /// Call `.next().unwrap()` once on the iterator to skip the node itself.
-    pub fn preceding_siblings(self, node_layout: &NodeHierarchy) -> PrecedingSiblings {
+    #[inline]
+    pub const fn preceding_siblings(self, node_layout: &NodeHierarchy) -> PrecedingSiblings {
         PrecedingSiblings {
             node_layout,
             node: Some(self),
@@ -396,7 +401,8 @@ impl NodeId {
     /// Return an iterator of references to this node and the siblings after it.
     ///
     /// Call `.next().unwrap()` once on the iterator to skip the node itself.
-    pub fn following_siblings(self, node_layout: &NodeHierarchy) -> FollowingSiblings {
+    #[inline]
+    pub const fn following_siblings(self, node_layout: &NodeHierarchy) -> FollowingSiblings {
         FollowingSiblings {
             node_layout,
             node: Some(self),
@@ -404,6 +410,7 @@ impl NodeId {
     }
 
     /// Return an iterator of references to this node’s children.
+    #[inline]
     pub fn children(self, node_layout: &NodeHierarchy) -> Children {
         Children {
             node_layout,
@@ -412,6 +419,7 @@ impl NodeId {
     }
 
     /// Return an iterator of references to this node’s children, in reverse order.
+    #[inline]
     pub fn reverse_children(self, node_layout: &NodeHierarchy) -> ReverseChildren {
         ReverseChildren {
             node_layout,
@@ -423,12 +431,14 @@ impl NodeId {
     ///
     /// Parent nodes appear before the descendants.
     /// Call `.next().unwrap()` once on the iterator to skip the node itself.
-    pub fn descendants(self, node_layout: &NodeHierarchy) -> Descendants {
+    #[inline]
+    pub const fn descendants(self, node_layout: &NodeHierarchy) -> Descendants {
         Descendants(self.traverse(node_layout))
     }
 
     /// Return an iterator of references to this node and its descendants, in tree order.
-    pub fn traverse(self, node_layout: &NodeHierarchy) -> Traverse {
+    #[inline]
+    pub const fn traverse(self, node_layout: &NodeHierarchy) -> Traverse {
         Traverse {
             node_layout,
             root: self,
@@ -437,7 +447,8 @@ impl NodeId {
     }
 
     /// Return an iterator of references to this node and its descendants, in tree order.
-    pub fn reverse_traverse(self, node_layout: &NodeHierarchy) -> ReverseTraverse {
+    #[inline]
+    pub const fn reverse_traverse(self, node_layout: &NodeHierarchy) -> ReverseTraverse {
         ReverseTraverse {
             node_layout,
             root: self,

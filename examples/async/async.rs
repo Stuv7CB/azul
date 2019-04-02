@@ -24,9 +24,12 @@ struct MyDataModel {
 }
 
 impl Layout for MyDataModel {
+
     fn layout(&self, _info: LayoutInfo<Self>) -> Dom<Self> {
 
         use self::ConnectionStatus::*;
+
+        println!("layout!");
 
         let status = match &self.connection_status {
             ConnectionStatus::NotConnected       => format!("Not connected!"),
@@ -34,20 +37,21 @@ impl Layout for MyDataModel {
             ConnectionStatus::InProgress(_, d)   => format!("Loading... {}.{:02}s", d.as_secs(), d.subsec_millis()),
         };
 
-        let mut dom = Dom::new(NodeType::Div)
+        let mut dom = Dom::div()
             .with_child(Label::new(status.clone()).dom());
 
         match &self.connection_status {
             NotConnected => {
-                let button = Button::with_label("Connect to database...").dom()
-                                .with_callback(On::MouseUp, Callback(start_connection));
-
-                dom.add_child(button);
+                dom.add_child(
+                    Button::with_label("Connect to database...").dom()
+                    .with_callback(On::MouseUp, Callback(start_connection))
+                );
             },
             Connected => {
-                let button = Button::with_label(format!("{}\nRetry?", status)).dom()
-                                .with_callback(On::MouseUp, Callback(reset_connection));
-                dom.add_child(button);
+                dom.add_child(
+                    Button::with_label(format!("{}\nRetry?", status)).dom()
+                    .with_callback(On::MouseUp, Callback(reset_connection))
+                );
             }
             InProgress(_, _) => { },
         }
@@ -66,26 +70,27 @@ fn start_connection(app_state: &mut AppState<MyDataModel>, _event: &mut Callback
     app_state.data.modify(|state| state.connection_status = status)?;
     let task = Task::new(&app_state.data, connect_to_db_async);
     app_state.add_task(task);
-    app_state.add_daemon(DaemonId::new(), Daemon::new(timer_daemon));
+    app_state.add_timer(TimerId::new(), Timer::new(timer_timer));
     Redraw
 }
 
-fn timer_daemon(state: &mut MyDataModel, _resources: &mut AppResources) -> (UpdateScreen, TerminateDaemon) {
+fn timer_timer(state: &mut MyDataModel, _resources: &mut AppResources) -> (UpdateScreen, TerminateTimer) {
     if let ConnectionStatus::InProgress(start, duration) = &mut state.connection_status {
         *duration = Instant::now() - *start;
-        (Redraw, TerminateDaemon::Continue)
+        (Redraw, TerminateTimer::Continue)
     } else {
-        (DontRedraw, TerminateDaemon::Terminate)
+        (DontRedraw, TerminateTimer::Terminate)
     }
 }
 
-fn connect_to_db_async(app_data: Arc<Mutex<MyDataModel>>, _: Arc<()>) {
+fn connect_to_db_async(app_data: Arc<Mutex<MyDataModel>>, _: DropCheck) {
     thread::sleep(Duration::from_secs(10)); // simulate slow load
     app_data.modify(|state| state.connection_status = ConnectionStatus::Connected);
 }
 
 fn main() {
     let model = MyDataModel { connection_status: ConnectionStatus::NotConnected };
-    let app = App::new(model, AppConfig::default());
-    app.run(Window::new(WindowCreateOptions::default(), css::native()).unwrap()).unwrap();
+    let mut app = App::new(model, AppConfig::default()).unwrap();
+    let window = app.create_window(WindowCreateOptions::default(), css::native()).unwrap();
+    app.run(window).unwrap();
 }

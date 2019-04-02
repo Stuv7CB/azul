@@ -1,7 +1,3 @@
-//! The compositor takes all the textures for a frame and draws them on top of each other.
-//! This makes it possible to use OpenGL images in the background and compose SVG elements
-//! into the UI.
-
 use std::sync::{Mutex, atomic::{Ordering, AtomicUsize}};
 use webrender::{
     ExternalImageHandler, ExternalImage, ExternalImageSource,
@@ -10,7 +6,7 @@ use webrender::{
 use euclid::TypedPoint2D;
 use {
     FastHashMap,
-    dom::Texture,
+    callbacks::Texture,
 };
 
 static LAST_OPENGL_ID: AtomicUsize = AtomicUsize::new(0);
@@ -51,7 +47,7 @@ pub(crate) struct ActiveTexture {
 unsafe impl Send for ActiveTexture { }
 unsafe impl Sync for ActiveTexture { }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub(crate) struct Compositor { }
 
 impl Default for Compositor {

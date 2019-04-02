@@ -1,5 +1,5 @@
 //! Types and methods used to describe the style of an application
-use css_properties::{CssProperty, CssPropertyType};
+use crate::css_properties::{CssProperty, CssPropertyType};
 use std::fmt;
 
 /// Css stylesheet - contains a parsed CSS stylesheet in "rule blocks",
@@ -25,7 +25,7 @@ impl From<Vec<CssRuleBlock>> for Stylesheet {
 }
 
 /// Contains one parsed `key: value` pair, static or dynamic
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum CssDeclaration {
     /// Static key-value pair, such as `width: 500px`
     Static(CssProperty),
@@ -34,6 +34,16 @@ pub enum CssDeclaration {
 }
 
 impl CssDeclaration {
+
+    /// Returns the type of the property (i.e. the CSS key as a typed enum)
+    pub fn get_type(&self) -> CssPropertyType {
+        use css::CssDeclaration::*;
+        match self {
+            Static(s) => s.get_type(),
+            Dynamic(d) => d.property_type,
+        }
+    }
+
     /// Determines if the property will be inherited (applied to the children)
     /// during the recursive application of the style on the DOM tree
     pub fn is_inheritable(&self) -> bool {
@@ -75,7 +85,7 @@ impl CssDeclaration {
 /// Dynamic style properties can also be used for animations and conditional styles
 /// (i.e. `hover`, `focus`, etc.), thereby leading to cleaner code, since all of these
 /// special cases now use one single API.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DynamicCssProperty {
     /// Key for this property
     pub property_type: CssPropertyType,
@@ -96,7 +106,7 @@ pub struct DynamicCssProperty {
 /// that, meaning that if you don't override the property, then you'd set it to 0px - which is
 /// different from `auto`, since `auto` has its width determined by how much space there is
 /// available in the parent.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DynamicCssPropertyDefault  {
     Exact(CssProperty),
     Auto,
@@ -395,7 +405,7 @@ fn test_specificity() {
 #[test]
 fn test_specificity_sort() {
     use self::CssPathSelector::*;
-    use NodeTypePath::*;
+    use crate::NodeTypePath::*;
 
     let mut input_style = Stylesheet {
         rules: vec![
